@@ -1,0 +1,36 @@
+# --- Secrets / credentials: NEVER commit ---
+*.pem
+*.key
+*.p12
+creds*.json
+*credential*.json
+.env
+.env.*
+id_ed25519*
+id_rsa*
+
+# --- Scratch / temp / logs ---
+.tmp/
+*.log
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.hypothesis/
+.venv/
+venv/
+
+# --- Build artifacts ---
+build/
+dist/
+*.egg-info/
+
+# --- Generated deploy artifacts (may contain login hints / ARNs) ---
+manifest.json
+roster.json
+
+# --- OS / editor ---
+.DS_Store
+*.swp
+.idea/

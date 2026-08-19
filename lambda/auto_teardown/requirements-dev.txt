@@ -1,0 +1,11 @@
+# Test-only dependencies for lambda/auto_teardown/test_handler.py.
+# Install into a throwaway venv, then run:  python -m pytest lambda/auto_teardown -q
+#
+# moto is pinned with the [all] extra on purpose: the tests create CloudFormation
+# stacks under moto, and moto's CloudFormation parser eagerly imports every
+# service model (e.g. apigateway -> openapi_spec_validator). Plain `moto` is not
+# enough for the CFN path; `moto[all]` pulls those optional deps. No real AWS is
+# ever contacted -- everything runs against moto's in-memory mocks.
+pytest>=7
+boto3>=1.26
+moto[all]>=5

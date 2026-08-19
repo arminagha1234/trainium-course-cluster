@@ -1,0 +1,686 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Trainium Course Cluster - Parent stack. Provisions VPC + EFS + S3 staging
+  bucket + Secrets Manager KMS key + the Student Manifest custom resource
+  Lambda. ParallelCluster is created separately via `pcluster create-cluster`
+  (see scripts/deploy.sh), consuming these outputs.
+
+  Design doc: docs/architecture.md
+
+Parameters:
+  ClusterName:
+    Type: String
+    AllowedPattern: '^[a-z][a-z0-9-]{2,39}$'
+    Description: >
+      Cluster name (lowercase, 3-40 chars). Also used as the ParallelCluster
+      cluster name, so must be unique in the region.
+
+  ClassTag:
+    Type: String
+    Default: nki-2026-fall
+    AllowedPattern: '^[a-zA-Z0-9._:/=+-]{1,128}$'
+    Description: >
+      Applied to every resource as tag `Class`. Enable this in Billing >
+      Cost Allocation Tags to make the budget filter work.
+
+  StudentCount:
+    Type: Number
+    MinValue: 1
+    MaxValue: 500
+    Description: Number of student POSIX accounts + SSH keypairs to generate.
+
+  UsernamePrefix:
+    Type: String
+    Default: student
+    AllowedPattern: '^[a-z][a-z0-9]{0,9}$'
+    Description: >
+      Username prefix. Students become <prefix>01..<prefix>NN (zero-padded).
+
+  CapacityReservationId:
+    Type: String
+    AllowedPattern: '^cr-[0-9a-f]{8,17}$'
+    Description: >
+      Pre-purchased ML Capacity Block reservation id for trn2.3xlarge.
+      Format cr-XXXXXXXX. Consumed by pcluster-config.yaml at cluster-create
+      time; parent stack does not target it directly.
+
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: >
+      AZ the MLCB is in. Private subnet is pinned here. If this does not
+      match the reservation's AZ, compute nodes will fail to launch.
+
+  SshAllowedCidr:
+    Type: CommaDelimitedList
+    Description: >
+      Source CIDR(s) allowed to reach the head node on TCP/22, as a
+      comma-separated list of EXACTLY 5 elements: one or more real CIDR ranges
+      followed by empty placeholders (divergence D8; Requirements 23.3, 23.5).
+      scripts/deploy.sh builds this fixed-length list for you from
+      --ssh-allowed-cidr (one CIDR, or up to 5 comma-separated ranges): it
+      validates each range and pads to 5 with empty entries. One head-node
+      TCP/22 ingress rule is emitted per non-empty range (indices 0..4). Open
+      ranges (0.0.0.0/0, ::/0) are rejected anywhere in the list by the Rules
+      block below (deploy.sh rejects them too). Use your campus network or VPN
+      CIDR; never an open range. If you invoke this template directly (not via
+      deploy.sh) you MUST pad the list to 5 elements yourself.
+
+  VpcCidr:
+    Type: String
+    Default: 10.42.0.0/16
+    AllowedPattern: '^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+)$'
+    Description: VPC CIDR block. Change on collision with peered networks.
+
+  PublicSubnetCidr:
+    Type: String
+    Default: 10.42.0.0/24
+    Description: Public subnet CIDR (head node lives here).
+
+  PrivateSubnetCidr:
+    Type: String
+    Default: 10.42.1.0/24
+    Description: Private subnet CIDR (compute nodes; pinned to AvailabilityZone).
+
+  EfsThroughputMode:
+    Type: String
+    Default: elastic
+    AllowedValues: [ elastic, bursting ]
+    Description: EFS throughput mode.
+
+  ManifestLambdaCodeBucket:
+    Type: String
+    Description: S3 bucket containing the packaged Lambda zip.
+
+  ManifestLambdaCodeKey:
+    Type: String
+    Description: S3 key of the packaged Lambda zip (e.g. lambda/student_manifest.zip).
+
+  RetainEfsOnDelete:
+    Type: String
+    Default: 'true'
+    AllowedValues: [ 'true', 'false' ]
+    Description: >
+      If true, the EFS filesystem uses DeletionPolicy Retain so student work
+      survives stack deletion. Set false only if you want a clean sweep.
+
+Conditions:
+  RetainEfs: !Equals [ !Ref RetainEfsOnDelete, 'true' ]
+  # SshAllowedCidr is a fixed-length (5-element) CommaDelimitedList: index 0 is
+  # always a real range (deploy.sh guarantees at least one), while indices 1..4
+  # are either a real range or an empty placeholder. One head-node TCP/22
+  # ingress rule is created per non-empty element; these conditions gate the
+  # optional rules for indices 1..4 (divergence D8; Requirements 23.3, 23.5).
+  HasSshCidr2: !Not [ !Equals [ !Select [ 1, !Ref SshAllowedCidr ], '' ] ]
+  HasSshCidr3: !Not [ !Equals [ !Select [ 2, !Ref SshAllowedCidr ], '' ] ]
+  HasSshCidr4: !Not [ !Equals [ !Select [ 3, !Ref SshAllowedCidr ], '' ] ]
+  HasSshCidr5: !Not [ !Equals [ !Select [ 4, !Ref SshAllowedCidr ], '' ] ]
+
+Rules:
+  # Belt-and-braces (Requirement 14.2): reject an open SSH range appearing
+  # ANYWHERE in the SshAllowedCidr list, so the stack is blocked before any
+  # resource is created even if deploy.sh's own per-range check is bypassed.
+  # Fn::Contains scans the whole list, so this covers every supplied range.
+  RejectOpenSshCidr:
+    Assertions:
+      - Assert: !Not [ !Contains [ !Ref SshAllowedCidr, '0.0.0.0/0' ] ]
+        AssertDescription: SshAllowedCidr must not include 0.0.0.0/0. Do not deploy with open SSH.
+      - Assert: !Not [ !Contains [ !Ref SshAllowedCidr, '::/0' ] ]
+        AssertDescription: SshAllowedCidr must not include ::/0. Do not deploy with open SSH.
+
+Resources:
+  # ==========================================================================
+  # Networking: single-AZ VPC with a public subnet (head) and a private subnet
+  # (compute) pinned to the MLCB's AZ.
+  # ==========================================================================
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ClusterName}-vpc
+        - Key: Class
+          Value: !Ref ClassTag
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${ClusterName}-igw
+        - Key: Class
+          Value: !Ref ClassTag
+
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnetCidr
+      AvailabilityZone: !Ref AvailabilityZone
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ClusterName}-public
+        - Key: Class
+          Value: !Ref ClassTag
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnetCidr
+      AvailabilityZone: !Ref AvailabilityZone
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${ClusterName}-private
+        - Key: Class
+          Value: !Ref ClassTag
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${ClusterName}-public-rt
+        - Key: Class
+          Value: !Ref ClassTag
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicRtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: IgwAttach
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${ClusterName}-nat-eip
+        - Key: Class
+          Value: !Ref ClassTag
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub ${ClusterName}-nat
+        - Key: Class
+          Value: !Ref ClassTag
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${ClusterName}-private-rt
+        - Key: Class
+          Value: !Ref ClassTag
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateRtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  # S3 gateway endpoint. Free, and it keeps EFS-mount + Neuron-package
+  # traffic to S3 off the NAT (both cost + reliability wins).
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      RouteTableIds:
+        - !Ref PublicRouteTable
+        - !Ref PrivateRouteTable
+      VpcEndpointType: Gateway
+
+  # ==========================================================================
+  # Security groups
+  # ==========================================================================
+  HeadNodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${ClusterName} head node - restricted student SSH ingress
+      VpcId: !Ref Vpc
+      # SSH ingress is attached below as one AWS::EC2::SecurityGroupIngress
+      # resource per supplied SshAllowedCidr range (divergence D8), so the head
+      # node can be reached from several approved networks (e.g. campus + VPN).
+      Tags:
+        - Key: Name
+          Value: !Sub ${ClusterName}-head-sg
+        - Key: Class
+          Value: !Ref ClassTag
+
+  # One TCP/22 ingress rule per supplied SSH range (Requirements 23.3, 23.5).
+  # Rule 1 (index 0) is always present - deploy.sh guarantees at least one real
+  # range - while rules 2..5 are created only when their element is a non-empty
+  # placeholder. Every rule sources a specific approved CIDR; open ranges
+  # (0.0.0.0/0, ::/0) are rejected up front by the Rules block (Req 14.1, 14.2).
+  HeadNodeSshIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref HeadNodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Select [ 0, !Ref SshAllowedCidr ]
+      Description: SSH from the course network (range 1)
+
+  HeadNodeSshIngress2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasSshCidr2
+    Properties:
+      GroupId: !Ref HeadNodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Select [ 1, !Ref SshAllowedCidr ]
+      Description: SSH from the course network (range 2)
+
+  HeadNodeSshIngress3:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasSshCidr3
+    Properties:
+      GroupId: !Ref HeadNodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Select [ 2, !Ref SshAllowedCidr ]
+      Description: SSH from the course network (range 3)
+
+  HeadNodeSshIngress4:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasSshCidr4
+    Properties:
+      GroupId: !Ref HeadNodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Select [ 3, !Ref SshAllowedCidr ]
+      Description: SSH from the course network (range 4)
+
+  HeadNodeSshIngress5:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasSshCidr5
+    Properties:
+      GroupId: !Ref HeadNodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Select [ 4, !Ref SshAllowedCidr ]
+      Description: SSH from the course network (range 5)
+
+  ComputeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${ClusterName} compute - no direct ingress; PC adds intra-cluster rules
+      VpcId: !Ref Vpc
+      # ParallelCluster attaches its own SG to compute for slurmd/munge intra-
+      # cluster traffic. We only need an "additional" SG that adds nothing.
+      Tags:
+        - Key: Name
+          Value: !Sub ${ClusterName}-compute-sg
+        - Key: Class
+          Value: !Ref ClassTag
+
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${ClusterName} EFS - NFS from head + compute only
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${ClusterName}-efs-sg
+        - Key: Class
+          Value: !Ref ClassTag
+
+  EfsIngressHead:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EfsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      SourceSecurityGroupId: !Ref HeadNodeSecurityGroup
+      Description: NFS from head node
+
+  EfsIngressCompute:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EfsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      SourceSecurityGroupId: !Ref ComputeSecurityGroup
+      Description: NFS from compute nodes
+
+  # ==========================================================================
+  # EFS: shared /shared across head + compute. Encryption at rest is on.
+  # Retention is instructor-controlled via RetainEfsOnDelete.
+  # ==========================================================================
+  EfsFilesystem:
+    Type: AWS::EFS::FileSystem
+    DeletionPolicy: !If [ RetainEfs, Retain, Delete ]
+    UpdateReplacePolicy: !If [ RetainEfs, Retain, Delete ]
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: !Ref EfsThroughputMode
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub ${ClusterName}-efs
+        - Key: Class
+          Value: !Ref ClassTag
+
+  # EFS mount targets are AZ-scoped, not subnet-scoped: exactly ONE mount
+  # target per AZ, and it serves every subnet in that AZ. Since our VPC uses
+  # a single AZ (pinned to the MLCB), we need exactly one mount target. We
+  # place it in the private subnet; the head node in the public subnet
+  # reaches it via VPC-local routing plus the EfsSecurityGroup ingress rule.
+  # Multi-AZ would require one mount target per AZ, but MLCBs are single-AZ
+  # so V0 does not need that.
+  EfsMount:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EfsFilesystem
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroups:
+        - !Ref EfsSecurityGroup
+
+  # ==========================================================================
+  # S3 staging bucket. Holds:
+  #   - bootstrap/*.sh          (uploaded by deploy.sh before pcluster create)
+  #   - slurm/neuroncore-gres.conf  (rendered by deploy.sh)
+  #   - roster/roster.json       (written by manifest Lambda; read by head bootstrap)
+  #   - student/RUNBOOK.md, student/run.sh  (uploaded by deploy.sh; distributed to homes)
+  # ==========================================================================
+  StagingBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub ${ClusterName}-${AWS::AccountId}-${AWS::Region}-staging
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-noncurrent
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      Tags:
+        - Key: Class
+          Value: !Ref ClassTag
+
+  # ==========================================================================
+  # Alerts SNS topic. Budget stack subscribes actions here.
+  # ==========================================================================
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${ClusterName}-alerts
+      DisplayName: !Sub ${ClusterName} alerts
+      Tags:
+        - Key: Class
+          Value: !Ref ClassTag
+
+  # ==========================================================================
+  # Slurm accounting DB password (Requirement 18; divergence D5).
+  #
+  # Per-student limits (MaxWall / MaxJobsPerUser / MaxTRESPerUser / core-hours)
+  # are only ENFORCED when Slurm accounting (slurmdbd) is active, and PC's
+  # slurmdbd needs a MySQL-protocol backend. Rather than an RDS/Aurora instance
+  # (extra cost + a second AZ the single-AZ MLCB layout can't host), the head
+  # node runs a LOCAL MariaDB and PC points slurmdbd at 127.0.0.1:3306
+  # (SlurmSettings.Database in pcluster-config.yaml). This secret holds the
+  # password for that MySQL account (user `slurm`). It is consumed twice, both
+  # keyed off this one ARN so the password matches on both sides:
+  #   1. bootstrap/head-node-setup.sh reads it (ARN passed as OnNodeConfigured
+  #      arg $7) to CREATE the MySQL user with this password.
+  #   2. PC's Database.PasswordSecretArn reads it so slurmdbd AUTHENTICATES with
+  #      the same password.
+  SlurmDbPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub trn-course-${ClusterName}-slurmdb-password
+      Description: !Sub Password for the head-node-local MariaDB Slurm accounting user (${ClusterName})
+      GenerateSecretString:
+        PasswordLength: 32
+        # Exclude characters that would break the value where it is used: the
+        # host:port URI form and MySQL/shell/SQL quoting. We embed the fetched
+        # password in single-quoted SQL (IDENTIFIED BY '...') and shell strings
+        # on the head node, so we drop: double/single quote, backslash, at-sign,
+        # forward slash, dollar, and space. 32 chars minus these still leaves
+        # ample entropy. (Task guidance: exclude e.g. "@/\ and spaces.)
+        ExcludeCharacters: '@/\"''$ '
+        ExcludePunctuation: false
+      Tags:
+        - Key: Class
+          Value: !Ref ClassTag
+
+  # ==========================================================================
+  # Manifest custom resource: generates per-student SSH keypairs + secrets,
+  # writes the roster to S3, returns the TA-facing manifest as stack output.
+  # ==========================================================================
+  ManifestLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: KeyPairAndSecretsAndS3
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # ec2 keypair scratch space: create ed25519 keypair, read public
+              # key, then delete. Scoped to keypairs we name.
+              - Effect: Allow
+                Action:
+                  - ec2:CreateKeyPair
+                  - ec2:DescribeKeyPairs
+                  - ec2:DeleteKeyPair
+                Resource: '*'
+              # CreateKeyPair with TagSpecifications requires ec2:CreateTags
+              # as a separate permission. Scoped via ec2:CreateAction so the
+              # role can only tag keypairs at the moment of CreateKeyPair.
+              - Effect: Allow
+                Action: ec2:CreateTags
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    ec2:CreateAction: CreateKeyPair
+              # Secrets Manager: create + write + delete per-student secrets.
+              # ListSecrets is a * action (not resource-scoped by AWS) — the
+              # Delete path in the Lambda uses it with a name-prefix filter,
+              # which is enforced client-side.
+              - Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:DeleteSecret
+                  - secretsmanager:TagResource
+                Resource:
+                  - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:trn-course-${ClusterName}-*
+              - Effect: Allow
+                Action: secretsmanager:ListSecrets
+                Resource: '*'
+              # S3: write the roster + read/list for idempotence checks.
+              # PutObject with Tagging= requires s3:PutObjectTagging alongside
+              # s3:PutObject — we tag the roster/manifest for cost allocation.
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectTagging
+                  - s3:GetObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${StagingBucket}
+                  - !Sub arn:aws:s3:::${StagingBucket}/*
+      Tags:
+        - Key: Class
+          Value: !Ref ClassTag
+
+  ManifestLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ClusterName}-manifest
+      Runtime: python3.12
+      Handler: handler.on_event
+      Role: !GetAtt ManifestLambdaRole.Arn
+      Timeout: 900        # 15 min - up to 500 keypairs is fine.
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref ManifestLambdaCodeBucket
+        S3Key: !Ref ManifestLambdaCodeKey
+      Environment:
+        Variables:
+          CLUSTER_NAME: !Ref ClusterName
+          CLASS_TAG: !Ref ClassTag
+          STAGING_BUCKET: !Ref StagingBucket
+          USERNAME_PREFIX: !Ref UsernamePrefix
+          UID_BASE: '10000'
+          # NOTE: passing region explicitly - boto3 default region resolution
+          # inside Lambda can miss when the request is a CFN custom resource.
+          AWS_TARGET_REGION: !Ref AWS::Region
+      Tags:
+        - Key: Class
+          Value: !Ref ClassTag
+
+  ManifestLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ClusterName}-manifest
+      RetentionInDays: 30
+
+  StudentManifest:
+    Type: Custom::StudentManifest
+    DependsOn:
+      - StagingBucket
+      - ManifestLambdaLogGroup
+    Properties:
+      ServiceToken: !GetAtt ManifestLambda.Arn
+      StudentCount: !Ref StudentCount
+      # Bump this string to force a re-run (e.g. new keys). CFN treats any
+      # change in properties as a resource update.
+      Revision: v1
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Export:
+      Name: !Sub ${ClusterName}-vpc-id
+
+  PublicSubnetId:
+    Value: !Ref PublicSubnet
+    Export:
+      Name: !Sub ${ClusterName}-public-subnet-id
+
+  PrivateSubnetId:
+    Value: !Ref PrivateSubnet
+    Export:
+      Name: !Sub ${ClusterName}-private-subnet-id
+
+  HeadNodeSecurityGroupId:
+    Value: !Ref HeadNodeSecurityGroup
+    Export:
+      Name: !Sub ${ClusterName}-head-sg-id
+
+  ComputeSecurityGroupId:
+    Value: !Ref ComputeSecurityGroup
+    Export:
+      Name: !Sub ${ClusterName}-compute-sg-id
+
+  EfsFilesystemId:
+    Value: !Ref EfsFilesystem
+    Export:
+      Name: !Sub ${ClusterName}-efs-id
+
+  StagingBucketName:
+    Value: !Ref StagingBucket
+    Export:
+      Name: !Sub ${ClusterName}-staging-bucket
+
+  AlertsTopicArn:
+    Value: !Ref AlertsTopic
+    Export:
+      Name: !Sub ${ClusterName}-alerts-topic-arn
+
+  SlurmDbPasswordSecretArn:
+    Description: >
+      Secrets Manager ARN of the head-node-local MariaDB Slurm accounting
+      password. scripts/deploy.sh reads this and feeds it to both the PC
+      SlurmSettings.Database.PasswordSecretArn and head-node-setup.sh's $7 arg.
+    Value: !Ref SlurmDbPasswordSecret
+    Export:
+      Name: !Sub ${ClusterName}-slurmdb-secret-arn
+
+  StudentManifestJson:
+    Description: TA-facing manifest of student slots + Secrets Manager ARNs.
+    Value: !GetAtt StudentManifest.ManifestJson
+
+  StudentCount:
+    Value: !Ref StudentCount
+
+  AvailabilityZone:
+    Value: !Ref AvailabilityZone
+    Export:
+      Name: !Sub ${ClusterName}-az
+
+  CapacityReservationId:
+    Description: >
+      MLCB the compute fleet will target. Used by scripts/deploy.sh (via
+      pcluster-config.yaml) and by the auto-teardown Lambda to check the
+      reservation's EndDateTime.
+    Value: !Ref CapacityReservationId
+    Export:
+      Name: !Sub ${ClusterName}-cr-id

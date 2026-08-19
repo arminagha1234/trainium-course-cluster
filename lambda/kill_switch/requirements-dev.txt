@@ -1,0 +1,14 @@
+# Test-only dependencies for lambda/kill_switch/test_handler.py.
+# Install into a throwaway venv, then run:  python -m pytest lambda/kill_switch -q
+#
+# The Lambda *runtime* needs only boto3 (already in the AWS Lambda Python
+# runtime). The pins below exist ONLY for running test_handler.py locally.
+#
+# Unlike the auto_teardown suite (which drives moto's CloudFormation model and
+# therefore needs the moto[all] extra), these tests touch ONLY mocked EC2. The
+# base `moto>=5` package provides the unified `mock_aws` decorator with EC2
+# support, so no extras are required. No real AWS is ever contacted -- everything
+# runs against moto's in-memory mocks.
+pytest>=7
+boto3>=1.26
+moto>=5

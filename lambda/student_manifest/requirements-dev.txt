@@ -1,0 +1,26 @@
+# Development / test dependencies for the Student Manifest Lambda.
+#
+#   cd trainium-course-cluster/lambda/student_manifest
+#   python -m venv .venv && source .venv/bin/activate
+#   python -m pip install -r requirements-dev.txt
+#   python -m pytest -q
+#
+# The Lambda *runtime* needs only the standard library plus the boto3/botocore
+# that the AWS Lambda Python 3.12 runtime already ships (see README.md). The
+# pins below exist ONLY for running test_handler.py locally -- the moto-backed
+# unit tests plus the hypothesis property tests (design Properties P1-P7). All
+# AWS interaction is mocked by moto, so the suite makes no real AWS calls.
+
+# Test runner.
+pytest>=8.0,<9
+
+# AWS API mocking. moto 5.x provides the unified `mock_aws` decorator that
+# test_handler.py relies on (EC2 keypairs, Secrets Manager, S3).
+moto>=5.0,<6
+
+# Property-based testing for the StudentCount strategies + Properties P1-P7.
+hypothesis>=6.100,<7
+
+# boto3 is available in the Lambda runtime; pinned here for local test parity
+# and to satisfy moto's client expectations.
+boto3>=1.34

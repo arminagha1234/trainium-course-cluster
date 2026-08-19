@@ -1,0 +1,305 @@
+# ParallelCluster cluster configuration for the Trainium Course Cluster.
+#
+# This is a TEMPLATE. `scripts/deploy.sh` renders it via `envsubst` after
+# fetching the required values from the parent CloudFormation stack outputs.
+# Do NOT feed this file to `pcluster create-cluster` directly.
+#
+# Required environment variables at render time:
+#   REGION                    e.g. sa-east-1
+#   IMAGE_OS                  e.g. ubuntu2404
+#   (There is NO NEURON_INSTALL_SCRIPT variable: this template does not wire in
+#    a separate PC Neuron installer. The Neuron SDK + torch-neuronx are installed
+#    at first boot by the compute OnNodeConfigured hook, compute-node-setup.sh.)
+#   HEAD_NODE_INSTANCE_TYPE   e.g. m6i.xlarge
+#   HEAD_NODE_SUBNET_ID       from parent stack output
+#   COMPUTE_SUBNET_ID         from parent stack output (private, AZ-pinned)
+#   COMPUTE_SECURITY_GROUP_ID from parent stack output
+#   HEAD_SECURITY_GROUP_ID    from parent stack output
+#   COMPUTE_INSTANCE_TYPE     e.g. trn2.3xlarge
+#   COMPUTE_NODE_COUNT        e.g. 1
+#   NEURONCORE_COUNT          NeuronCores per compute node (e.g. 4 for trn2.3xlarge,
+#                             16 for trn2.48xlarge). Rendered into the HeadNode
+#                             OnNodeConfigured $8 arg so head-node-setup.sh can
+#                             append `Gres=neuroncore:N` to ParallelCluster's own
+#                             compute NodeName line (PC deny-lists Gres/NodeName
+#                             for CustomSlurmSettings, so the include cannot do it).
+#   CAPACITY_RESERVATION_ID   e.g. cr-0abc123
+#   EFS_FILESYSTEM_ID         from parent stack output
+#   STAGING_BUCKET            from parent stack output (S3 bucket for bootstrap + slurm include)
+#   HEAD_DB_BOOTSTRAP_SCRIPT  s3://<bucket>/bootstrap/head-node-db-setup.sh (HeadNode OnNodeStart)
+#   HEAD_BOOTSTRAP_SCRIPT     s3://<bucket>/bootstrap/head-node-setup.sh
+#   COMPUTE_BOOTSTRAP_SCRIPT  s3://<bucket>/bootstrap/compute-node-setup.sh
+#   SLURM_INCLUDE_FILE        s3://<bucket>/slurm/neuroncore-gres.conf
+#   ADMIN_SSH_KEY_NAME        EC2 key pair name for the ubuntu sudoer on the head node
+#   CLUSTER_TAG               e.g. nki-2026-fall (single string, will be applied as tag key `Class`)
+#
+# Optional render variables (deploy.sh may leave these empty; empty == feature off):
+#   CUSTOM_AMI_LINE           Full YAML line for the optional pinned Neuron AMI, or "".
+#                             Built by scripts/deploy.sh (task 5.2) from NEURON_AMI_ID as
+#                             '  CustomAmi: <ami-id>' (note the leading 2-space indent) when
+#                             an AMI is supplied, or "" to omit it entirely. See the Image
+#                             block below and Requirement 19.1 / divergence D4 for the
+#                             full render convention.
+
+Region: ${REGION}
+
+Image:
+  Os: ${IMAGE_OS}
+  # --- Optional pinned custom Neuron AMI (Requirement 19.1; addresses divergence D4) -----
+  # If the operator supplies a Neuron AMI id, ParallelCluster must use THAT AMI verbatim
+  # (Image.CustomAmi) and must NOT fall back to its default image. If no AMI id is supplied,
+  # the CustomAmi key MUST be omitted entirely (PC then uses its default image); a dangling
+  # "CustomAmi:" with an empty value is invalid and must never be emitted.
+  #
+  # envsubst cannot drop a line conditionally on its own, so the ENTIRE CustomAmi line is
+  # carried by a single render variable, ${CUSTOM_AMI_LINE}, placed at column 0 on the next
+  # line. scripts/deploy.sh (task 5.2) sets it to EXACTLY one of:
+  #
+  #     CUSTOM_AMI_LINE='  CustomAmi: <ami-id>'   # supplied  -> 2-space indent baked into the
+  #                                               #              value so the key nests here
+  #     CUSTOM_AMI_LINE=''                        # not supplied -> renders a blank line
+  #
+  # where <ami-id> is the resolved NEURON_AMI_ID (task 5.2 supplies either the operator's
+  # value or the pinned default, and validates it resolves in-region per Reqs 19.2 / 19.4).
+  # Keep the placeholder below at column 0: its indentation is part of the variable value,
+  # not this template. If CUSTOM_AMI_LINE is unset/empty the line renders blank -- valid
+  # YAML that yields PC's default image (also the behavior before task 5.2 lands).
+${CUSTOM_AMI_LINE}
+
+Tags:
+  - Key: Class
+    Value: ${CLUSTER_TAG}
+  - Key: Purpose
+    Value: trn-course-cluster
+  - Key: AutoStop
+    Value: 'false'  # MLCB is prepaid; do not stop the fleet mid-block
+
+# -----------------------------------------------------------------------------
+# Head node: login, slurmctld, home dirs live here.
+# Public subnet so students can SSH in from --ssh-allowed-cidr.
+# -----------------------------------------------------------------------------
+HeadNode:
+  InstanceType: ${HEAD_NODE_INSTANCE_TYPE}
+
+  Networking:
+    SubnetId: ${HEAD_NODE_SUBNET_ID}
+    AdditionalSecurityGroups:
+      - ${HEAD_SECURITY_GROUP_ID}
+
+  Ssh:
+    # Admin (`ubuntu` sudoer) SSH key. Students do NOT use this — they use
+    # per-user ed25519 keys generated by the manifest Lambda and installed
+    # into each POSIX user's authorized_keys by head-node-setup.sh.
+    KeyName: ${ADMIN_SSH_KEY_NAME}
+
+  LocalStorage:
+    RootVolume:
+      Size: 100
+      VolumeType: gp3
+      Encrypted: true
+
+  Iam:
+    # Grant head node read access to the staging bucket so the bootstrap
+    # script can pull the roster + student public keys.
+    S3Access:
+      - BucketName: ${STAGING_BUCKET}
+        EnableWriteAccess: false
+    AdditionalIamPolicies:
+      - Policy: arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+
+  CustomActions:
+    # OnNodeStart runs BEFORE ParallelCluster configures the node (i.e. before
+    # the cookbook converge). It MUST provision the head-node-local MariaDB
+    # accounting DB + `slurm` user here, because PC's own
+    # `aws-parallelcluster-slurm::config_slurm_accounting` recipe runs DURING
+    # that converge (before OnNodeConfigured): it starts slurmdbd and then blocks
+    # on an "execute[wait for slurm database]" step that fails the whole converge
+    # if the DB at 127.0.0.1:3306 is not reachable. Provisioning the DB in
+    # OnNodeConfigured would be too late — the converge (and head-node bootstrap)
+    # would already have aborted. Args are positional; head-node-db-setup.sh
+    # reads $1=region $2=Slurm accounting DB password Secrets Manager ARN (an
+    # empty ARN => accounting off, script exits 0 without provisioning).
+    OnNodeStart:
+      Script: ${HEAD_DB_BOOTSTRAP_SCRIPT}
+      Args:
+        - ${REGION}
+        - "${SLURM_DB_PASSWORD_SECRET_ARN}"
+    OnNodeConfigured:
+      Script: ${HEAD_BOOTSTRAP_SCRIPT}
+      # Args are positional. head-node-setup.sh reads:
+      #   $1=staging bucket  $2=region
+      #   $3=max wall time   $4=max concurrent jobs/user
+      #   $5=max cores/user  $6=per-student core-hours budget
+      #   $7=Slurm accounting DB password Secrets Manager ARN
+      #   $8=NeuronCores per node (for the NodeName gres attach)
+      # $3..$6 carry the per-student Slurm limits (Requirement 18; divergence
+      # D5). $7 carries the Secrets Manager ARN of the head-node-local MariaDB
+      # accounting password: head-node-setup.sh reads it to CREATE the MySQL
+      # `slurm` user, while the Database block below reads the SAME secret so
+      # slurmdbd authenticates with the same password. $8 carries the per-node
+      # NeuronCore count so head-node-setup.sh (section 6.5) can append
+      # `Gres=neuroncore:N` to ParallelCluster's own compute NodeName line (PC
+      # deny-lists Gres/NodeName for CustomSlurmSettings, so the rendered Slurm
+      # include cannot attach it). head-node-setup.sh prefers the matching env
+      # vars but falls back to these positional args, so the order here is the
+      # contract. scripts/deploy.sh sets the MAX_* / CORE_HOURS_BUDGET /
+      # SLURM_DB_PASSWORD_SECRET_ARN / NEURONCORE_COUNT render variables in
+      # the same envsubst block that renders this file. All limit values, the
+      # ARN, and the core count are quoted so they always render as YAML strings
+      # (the wall-time value contains colons and dashes and the ARN contains
+      # colons; PC's Args schema is a list of strings).
+      Args:
+        - ${STAGING_BUCKET}
+        - ${REGION}
+        - "${MAX_WALL_TIME}"
+        - "${MAX_CONCURRENT_JOBS_PER_USER}"
+        - "${MAX_CORES_PER_USER}"
+        - "${CORE_HOURS_BUDGET}"
+        - "${SLURM_DB_PASSWORD_SECRET_ARN}"
+        - "${NEURONCORE_COUNT}"
+
+# -----------------------------------------------------------------------------
+# Scheduling: single Slurm partition `nki` backed by the MLCB. Static nodes.
+# NeuronCore-level gres wired via CustomSlurmSettingsIncludeFile + compute
+# bootstrap. See docs/open-questions-answered.md#q2 for the design rationale.
+# -----------------------------------------------------------------------------
+Scheduling:
+  Scheduler: slurm
+
+  SlurmSettings:
+    # This URL provides GresTypes=neuroncore + `NodeName ... Gres=neuroncore:4`
+    # lines that PC appends to slurm.conf on the head node. gres.conf and
+    # cgroup.conf are NOT reachable through this mechanism — the compute
+    # bootstrap writes gres.conf directly. The same include file also carries
+    # the accounting-enforcement directives (AccountingStorageEnforce +
+    # AccountingStorageTRES=gres/neuroncore) that turn the per-student QoS /
+    # association limits below into hard gates on submission.
+    CustomSlurmSettingsIncludeFile: ${SLURM_INCLUDE_FILE}
+
+    # Slurm accounting backend (slurmdbd). REQUIRED for per-student limit
+    # enforcement (design divergence D5; Requirements 18.1, 18.2, 18.3).
+    #
+    # Why this is a real external DB and not `Database: {}`:
+    #   ParallelCluster's Slurm accounting ONLY works against an external
+    #   MySQL-protocol database (RDS / Aurora) — there is no "local accounting"
+    #   mode. `Uri`, `UserName`, and `PasswordSecretArn` are all *required*
+    #   fields, so the previous `Database: {}` was (a) schema-invalid and
+    #   (b) a silent no-op: without slurmdbd, `sacctmgr` cannot store QoS or
+    #   associations, so MaxWall / MaxJobsPerUser / MaxTRESPerUser /
+    #   GrpTRESMins are never enforced. (Confirmed against the PC v3 docs:
+    #   docs.aws.amazon.com/parallelcluster/latest/ug/slurm-accounting-v3.html
+    #   — "you must have an existing external database server ... mysql".
+    #   Behavior is PC-version-specific; treat as documented, not verified here.)
+    #
+    # With this block PC stands up slurmdbd on the head node and sets the
+    # PC-managed AccountingStorageType/Host/Port/User itself. head-node-setup.sh
+    # (task 3.2) then creates the per-student QoS + associations via sacctmgr,
+    # and AccountingStorageEnforce (in the rendered Slurm include) makes them bite.
+    #
+    # Render-time inputs — supplied by the deploy / parent-stack layer, NOT set
+    # in this file. Provisioning the accounting DB (e.g. an RDS/Aurora MySQL in
+    # infra/parent-stack.yaml) and exporting these vars is downstream follow-up
+    # owned by scripts/deploy.sh + infra/parent-stack.yaml (see task report):
+    #   SLURM_DB_URI                  host:port of the MySQL-protocol DB (no scheme)
+    #   SLURM_DB_USERNAME             DB user with read/write on the Slurm database
+    #   SLURM_DB_PASSWORD_SECRET_ARN  Secrets Manager ARN holding that user's password
+    Database:
+      Uri: ${SLURM_DB_URI}
+      UserName: ${SLURM_DB_USERNAME}
+      PasswordSecretArn: ${SLURM_DB_PASSWORD_SECRET_ARN}
+
+    # Node-idle scaledown timer (minutes). This is UNRELATED to accounting/QoS
+    # enforcement — that wiring lives in `Database` above and in the
+    # AccountingStorageEnforce directive of the rendered Slurm include. For
+    # static CAPACITY_BLOCK nodes PC holds MinCount up regardless; kept small.
+    ScaledownIdletime: 5
+
+  SlurmQueues:
+    - Name: nki
+      # CAPACITY_BLOCK requires static nodes (MinCount == MaxCount > 0).
+      # Docs: https://docs.aws.amazon.com/parallelcluster/latest/ug/launch-instances-capacity-blocks.html
+      CapacityType: CAPACITY_BLOCK
+
+      Networking:
+        SubnetIds:
+          - ${COMPUTE_SUBNET_ID}
+        AdditionalSecurityGroups:
+          - ${COMPUTE_SECURITY_GROUP_ID}
+        # Placement group not required for single-node kernel jobs and would
+        # over-constrain scheduling. Skip.
+        PlacementGroup:
+          Enabled: false
+
+      ComputeSettings:
+        LocalStorage:
+          RootVolume:
+            # Neuron guidance recommends a >=512GB root volume on Trn instances;
+            # this also gives headroom for the aws-neuronx-dkms build plus the
+            # torch-neuronx / neuronx-cc pip install done by the compute
+            # bootstrap (bootstrap/compute-node-setup.sh) at first boot.
+            Size: 512
+            VolumeType: gp3
+            Encrypted: true
+
+      Iam:
+        S3Access:
+          - BucketName: ${STAGING_BUCKET}
+            EnableWriteAccess: false
+        AdditionalIamPolicies:
+          - Policy: arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+
+      # compute-node-setup.sh itself installs the public Neuron SDK (driver +
+      # runtime + collectives + tools) and a shared torch-neuronx venv from the
+      # public Neuron apt/pip repos, then sets up the neuron group + udev, writes
+      # gres.conf, and syncs POSIX users from the shared roster. No custom AMI
+      # and no PC install_neuron.sh are used by default (PC allows exactly one
+      # OnNodeConfigured script per node, and this is it).
+      CustomActions:
+        OnNodeConfigured:
+          Script: ${COMPUTE_BOOTSTRAP_SCRIPT}
+          Args:
+            - ${STAGING_BUCKET}
+            - ${REGION}
+
+      ComputeResources:
+        - Name: trn2
+          InstanceType: ${COMPUTE_INSTANCE_TYPE}
+          MinCount: ${COMPUTE_NODE_COUNT}
+          MaxCount: ${COMPUTE_NODE_COUNT}
+          CapacityReservationTarget:
+            CapacityReservationId: ${CAPACITY_RESERVATION_ID}
+          # DisableSimultaneousMultithreading defaults to false. Kernel work
+          # doesn't lean on hyperthreads either way.
+
+# -----------------------------------------------------------------------------
+# Shared storage: EFS created by the parent stack, mounted at /shared on
+# every node.
+# -----------------------------------------------------------------------------
+SharedStorage:
+  - Name: shared
+    MountDir: /shared
+    StorageType: Efs
+    EfsSettings:
+      FileSystemId: ${EFS_FILESYSTEM_ID}
+      # No encryption toggle here — EFS is created encrypted at rest in the
+      # parent stack.
+
+# -----------------------------------------------------------------------------
+# Monitoring: enable CloudWatch dashboard and logs so the TA can see cluster
+# state without SSHing.
+# -----------------------------------------------------------------------------
+Monitoring:
+  Logs:
+    CloudWatch:
+      Enabled: true
+      RetentionInDays: 30
+  Dashboards:
+    CloudWatch:
+      Enabled: true
+
+# -----------------------------------------------------------------------------
+# NOTE on things we are NOT setting:
+#   - DevSettings.Cookbook.ExtraChefAttributes — resist unless needed.
+#   - Imds.Secured=false — leave IMDSv2 required.
+#   - DirectoryService — no LDAP/AD in V0. Users are local via bootstrap.
+# -----------------------------------------------------------------------------
