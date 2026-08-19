@@ -1,0 +1,452 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Trainium Course Cluster - AWS PCS (Parallel Computing Service) variant.
+  Best-effort CloudFormation mirror of pcs/scripts/deploy-pcs.sh: a self-
+  referencing security group, an AWSPCS-named IAM role + instance profile, an
+  EFS /shared filesystem + mount target, an EC2 launch template (capacity-block
+  market option + Capacity Block target + Neuron user-data that also mounts
+  /shared), and the AWS::PCS::Cluster / ComputeNodeGroup / Queue that together
+  run a Slurm cluster on a trn2 ML Capacity Block.
+
+  ---------------------------------------------------------------------------
+  THIS TEMPLATE MIRRORS pcs/scripts/deploy-pcs.sh (the proven CLI path). The
+  AWS::PCS::* property names below were checked against the current
+  CloudFormation Template Reference (AWS PCS section) at authoring time, but
+  the PCS CloudFormation schema is young and MAY DIFFER SLIGHTLY from what your
+  region/CFN endpoint accepts. It is NOT deploy-validated - the proven,
+  live-validated path is the CLI script. Search for "TODO(schema)" for the
+  spots most likely to need adjustment.
+
+  Verified against the CFN reference at authoring time:
+    * AWS::PCS::Cluster            -> Name, Size, Scheduler{Type,Version},
+                                      Networking{SubnetIds,SecurityGroupIds},
+                                      SlurmConfiguration{Accounting{Mode}}
+    * AWS::PCS::ComputeNodeGroup   -> ClusterId, AmiId, SubnetIds,
+                                      PurchaseOption, CustomLaunchTemplate
+                                      {TemplateId,Version}, IamInstanceProfileArn,
+                                      ScalingConfiguration{MinInstanceCount,
+                                      MaxInstanceCount}, InstanceConfigs[{InstanceType}]
+    * AWS::PCS::Queue              -> ClusterId, Name,
+                                      ComputeNodeGroupConfigurations[{ComputeNodeGroupId}]
+  Note the CLI uses `id=` for the launch template while CFN uses `TemplateId`.
+
+Parameters:
+  ClusterName:
+    Type: String
+    AllowedPattern: '^[A-Za-z][A-Za-z0-9-]{2,40}$'
+    Description: PCS cluster name (starts with a letter; letters/digits/hyphens).
+
+  CapacityReservationId:
+    Type: String
+    AllowedPattern: '^cr-[0-9a-f]{8,17}$'
+    Description: The trn2 ML Capacity Block reservation id (cr-XXXXXXXX).
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC that hosts the cluster + compute nodes.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: >
+      Private subnet used for BOTH the cluster control-plane ENI and the
+      compute node group. Its AZ MUST match the Capacity Block's AZ.
+
+  ComputeInstanceType:
+    Type: String
+    Default: trn2.3xlarge
+    Description: Trainium instance type; must match the Capacity Block's type.
+
+  ComputeNodeCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: >
+      Static node count. Set as both min and max instance count (Capacity
+      Blocks require static capacity). Must be <= the Capacity Block size.
+
+  NeuronCoresPerNode:
+    Type: Number
+    Default: 4
+    # Mirrors deploy-pcs.sh's per-shape PER_NODE_NEURONCORES derivation
+    # (trn2.3xlarge=4, trn2.48xlarge=16); used only to build the compute-node
+    # Feature `neuroncores<N>` below, which avoids needing a Mapping and keeps
+    # parity with the CLI's derived value. AllowedValues pins the two supported
+    # shapes; widen or remove it if you deploy another Trainium type.
+    AllowedValues: [4, 16]
+    Description: >
+      Per-node NeuronCore count used to build the node Feature
+      `neuroncores<N>` (4 for trn2.3xlarge, 16 for trn2.48xlarge). Drives
+      node-level selection via `--constraint=neuron` only; NeuronCore is not a
+      Slurm GRES on PCS.
+
+  PcsAmiId:
+    # Resolves the PCS sample AMI id from the SSM public parameter at deploy
+    # time, mirroring the `aws ssm get-parameter` call in deploy-pcs.sh.
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/pcs/ami/dlami-base-ubuntu2404/x86_64/latest/ami-id
+    Description: PCS base AMI (Ubuntu 24.04, x86_64), resolved from SSM.
+
+Resources:
+  # ==========================================================================
+  # Security group: self-referencing (all traffic within itself) + all egress.
+  # PCS documents exactly these rules for the cluster/compute SG:
+  #   inbound  All/All from Self; outbound All/All to 0.0.0.0/0 and to Self.
+  # We keep CloudFormation's default all-egress rule (by NOT specifying an
+  # inline SecurityGroupEgress) and add the self-referencing ingress as a
+  # separate resource (an inline self-ref is circular at create time).
+  # ==========================================================================
+  ClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'AWS PCS cluster SG for ${ClusterName} (self-referencing; all egress)'
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-pcs-sg'
+        - Key: Class
+          Value: !Ref ClusterName
+        - Key: Purpose
+          Value: trn-course-pcs
+
+  ClusterSgSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt ClusterSecurityGroup.GroupId
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !GetAtt ClusterSecurityGroup.GroupId
+      Description: All traffic from within the cluster SG (slurmctld/slurmd/munge/etc.)
+
+  # ==========================================================================
+  # EFS /shared filesystem + mount target (Phase 4).
+  #
+  # Students need a shared home + work area, and the reused job templates expect
+  # /shared. With no head node on PCS, /shared is NFS-mounted on every compute
+  # node by the launch-template UserData below (the fs id is injected via !Sub).
+  #
+  # NFS ingress needs NO extra rule: the mount target shares the self-referencing
+  # cluster SG, which already allows ALL traffic from within itself, and the
+  # compute nodes are in that same SG — so NFS/2049 compute -> mount target is
+  # already permitted (the Phase-1 login node joins the SG too). This is why the
+  # parent kit's dedicated EFS SG + explicit 2049 ingress rule is unnecessary
+  # here.
+  #
+  # Retain on stack delete/replace so student work is not lost (mirrors the
+  # parent stack's RetainEfsOnDelete=true default).
+  # ==========================================================================
+  EfsFilesystem:
+    Type: AWS::EFS::FileSystem
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: elastic
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-shared'
+        - Key: Class
+          Value: !Ref ClusterName
+        - Key: Purpose
+          Value: trn-course-pcs
+
+  # EFS mount targets are AZ-scoped: exactly one per AZ, serving every subnet in
+  # that AZ. This kit is single-AZ (one subnet), so one mount target suffices.
+  # It sits on the cluster SG so compute nodes (also in that SG) reach it on 2049.
+  EfsMountTarget:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EfsFilesystem
+      SubnetId: !Ref SubnetId
+      SecurityGroups:
+        - !GetAtt ClusterSecurityGroup.GroupId
+
+  # ==========================================================================
+  # IAM role (name MUST start with AWSPCS) + instance profile.
+  # PCS rejects a compute-node instance-profile role whose name does not start
+  # with `AWSPCS` (or carry the /aws-pcs/ path): "The role ARN is invalid".
+  # ==========================================================================
+  ComputeNodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'AWSPCS-${ClusterName}-compute'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSPCSComputeNodePolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Class
+          Value: !Ref ClusterName
+        - Key: Purpose
+          Value: trn-course-pcs
+
+  ComputeNodeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub 'AWSPCS-${ClusterName}-compute'
+      Roles:
+        - !Ref ComputeNodeRole
+
+  # ==========================================================================
+  # EC2 launch template: capacity-block market option + Capacity Block target
+  # + the cluster SG + base64 Neuron user-data + EFS /shared mount.
+  #
+  # NOTE: the UserData below MIRRORS pcs/bootstrap/neuron-userdata.sh and MUST
+  # be kept in sync with it. The canonical, commented copy is that file; this
+  # inline copy exists so the template is self-contained. It has NO
+  # ParallelCluster-specific roster sync / gres.conf (the PCS agent in the AMI
+  # handles Slurm registration) but it DOES mount the EFS /shared filesystem
+  # (Phase 4) and create the /shared/{home,work,assignments,etc} skeleton.
+  #
+  # Fn::Base64 uses !Sub so ${EfsFilesystem} (the EFS fs id) and ${AWS::Region}
+  # are injected into the EFS_FS_ID / EFS_REGION lines. CONSEQUENCE: under !Sub
+  # every ${...} is a substitution, so each SHELL variable is escaped as ${!VAR}
+  # (e.g. ${!NEURON_VENV}), which !Sub renders back to a literal ${VAR}; only the
+  # two CFN values above are left un-escaped. `$(...)`, `$1`, `$@` etc. are not
+  # ${...} sequences and need no escaping.
+  # TODO(schema): this !Sub-with-escaping is the spot most likely to bite on
+  # edit — cross-check against bootstrap/neuron-userdata.sh (the proven file).
+  # ==========================================================================
+  ComputeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub 'AWSPCS-${ClusterName}-lt'
+      LaunchTemplateData:
+        ImageId: !Ref PcsAmiId
+        InstanceType: !Ref ComputeInstanceType
+        InstanceMarketOptions:
+          MarketType: capacity-block
+        CapacityReservationSpecification:
+          CapacityReservationTarget:
+            CapacityReservationId: !Ref CapacityReservationId
+        SecurityGroupIds:
+          - !GetAtt ClusterSecurityGroup.GroupId
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Class
+                Value: !Ref ClusterName
+              - Key: Purpose
+                Value: trn-course-pcs
+        UserData:
+          # !Sub injects ${EfsFilesystem} (the EFS fs id) + ${AWS::Region}; every
+          # shell ${VAR} is escaped as ${!VAR} so !Sub emits a literal ${VAR}.
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # Neuron SDK + torch-neuronx install + EFS /shared mount (mirror of
+            # bootstrap/neuron-userdata.sh). Runs at first boot as root via cloud-init.
+            # No ParallelCluster roster sync / gres.conf; the PCS agent handles Slurm.
+            set -euo pipefail
+            LOG=/var/log/trn-course-pcs-neuron-userdata.log
+            exec > >(tee -a "$LOG") 2>&1
+            echo "[trn-course-pcs] neuron-userdata starting at $(date -u)"
+            export DEBIAN_FRONTEND=noninteractive
+            NEURON_VENV=/opt/aws_neuronx_venv_pytorch
+            # Injected by CloudFormation (!Sub). Empty => the EFS mount is skipped.
+            EFS_FS_ID="${EfsFilesystem}"
+            EFS_REGION="${AWS::Region}"
+            retry() {
+              local max="$1" label="$2"; shift 2; local attempt=1
+              while true; do
+                if "$@"; then return 0; fi
+                if (( attempt >= max )); then echo "[trn-course-pcs] ERROR: '${!label}' failed after ${!max} attempts" >&2; return 1; fi
+                echo "[trn-course-pcs] WARN: '${!label}' failed (attempt ${!attempt}/${!max}); retrying in $(( attempt * 10 ))s..." >&2
+                sleep $(( attempt * 10 )); (( attempt++ ))
+              done
+            }
+            if [[ -x "${!NEURON_VENV}/bin/python" ]] && "${!NEURON_VENV}/bin/python" -c "import torch_neuronx" >/dev/null 2>&1; then
+              echo "[trn-course-pcs] Neuron stack already present; skipping install"
+            else
+              . /etc/os-release
+              install -d -m 0755 /usr/share/keyrings
+              retry 5 "fetch Neuron GPG key" bash -c 'set -o pipefail; curl -fsSL https://apt.repos.neuron.amazonaws.com/GPG-PUB-KEY-AMAZON-AWS-NEURON.PUB | gpg --dearmor -o /usr/share/keyrings/neuron-keyring.gpg'
+              echo "deb [signed-by=/usr/share/keyrings/neuron-keyring.gpg] https://apt.repos.neuron.amazonaws.com ${!VERSION_CODENAME} main" >/etc/apt/sources.list.d/neuron.list
+              retry 5 "apt-get update" apt-get update
+              retry 5 "install headers + build deps" apt-get install -y "linux-headers-$(uname -r)" git python3.12-venv g++
+              for pkg in aws-neuronx-dkms aws-neuronx-collectives aws-neuronx-runtime-lib aws-neuronx-tools; do
+                retry 5 "install ${!pkg}" apt-get install -y "${!pkg}=2.*"
+              done
+              modprobe neuron 2>/dev/null || true
+              python3.12 -m venv "${!NEURON_VENV}"
+              retry 5 "pip upgrade" "${!NEURON_VENV}/bin/pip" install --upgrade pip
+              "${!NEURON_VENV}/bin/pip" config set global.extra-index-url https://pip.repos.neuron.amazonaws.com
+              retry 5 "pip install neuron stack" "${!NEURON_VENV}/bin/pip" install "neuronx-cc==2.*" "torch-neuronx==2.9.*" torchvision
+              chmod -R a+rX "${!NEURON_VENV}"
+            fi
+            if ! getent group neuron >/dev/null; then groupadd -r neuron; fi
+            cat >/etc/udev/rules.d/99-neuron.rules <<'RULE'
+            SUBSYSTEM=="neuron*", KERNEL=="neuron*", GROUP="neuron", MODE="0660"
+            RULE
+            udevadm control --reload 2>/dev/null || true
+            udevadm trigger --subsystem-match=neuron 2>/dev/null || true
+            # --- EFS /shared mount (Phase 4; mirror of neuron-userdata.sh) --------
+            # Non-fatal: a node without /shared still boots for diagnosis.
+            if [[ -n "${!EFS_FS_ID}" ]]; then
+              echo "[trn-course-pcs] mounting EFS ${!EFS_FS_ID} at /shared (region='${!EFS_REGION}')"
+              mkdir -p /shared
+              retry 3 "apt-get update (efs)" apt-get update || echo "[trn-course-pcs] WARN: apt-get update failed" >&2
+              if retry 3 "install amazon-efs-utils" apt-get install -y amazon-efs-utils; then
+                FSTAB_LINE="${!EFS_FS_ID}:/ /shared efs _netdev,tls 0 0"
+                MOUNT_CMD=(mount -t efs -o _netdev,tls "${!EFS_FS_ID}:/" /shared)
+              else
+                echo "[trn-course-pcs] WARN: amazon-efs-utils unavailable; falling back to nfs-common" >&2
+                retry 5 "install nfs-common" apt-get install -y nfs-common || echo "[trn-course-pcs] WARN: nfs-common install failed" >&2
+                EFS_DNS="${!EFS_FS_ID}.efs.${!EFS_REGION}.amazonaws.com"
+                FSTAB_LINE="${!EFS_DNS}:/ /shared nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,_netdev 0 0"
+                MOUNT_CMD=(mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,_netdev "${!EFS_DNS}:/" /shared)
+              fi
+              grep -qE '[[:space:]]/shared[[:space:]]' /etc/fstab || echo "${!FSTAB_LINE}" >> /etc/fstab
+              if mountpoint -q /shared; then
+                echo "[trn-course-pcs] /shared already mounted"
+              elif retry 5 "mount /shared" "${!MOUNT_CMD[@]}"; then
+                echo "[trn-course-pcs] mounted EFS ${!EFS_FS_ID} at /shared"
+              else
+                echo "[trn-course-pcs] WARN: could not mount EFS ${!EFS_FS_ID} at /shared" >&2
+              fi
+              if mountpoint -q /shared; then
+                install -d -m 755 /shared/home /shared/work /shared/assignments /shared/etc
+                echo "[trn-course-pcs] ensured /shared/{home,work,assignments,etc} skeleton"
+              fi
+            else
+              echo "[trn-course-pcs] EFS_FS_ID empty; skipping /shared mount"
+            fi
+            echo "[trn-course-pcs] neuron-userdata done at $(date -u)"
+
+  # ==========================================================================
+  # PCS cluster: SLURM 25.11 (24.11 is EOL - do NOT use), size SMALL, managed
+  # accounting (Accounting.Mode STANDARD - enables per-student QoS via sacctmgr
+  # on a follow-up login node, with no self-managed DB).
+  # ==========================================================================
+  PcsCluster:
+    Type: AWS::PCS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Size: SMALL
+      Scheduler:
+        Type: SLURM
+        Version: '25.11'
+      Networking:
+        SubnetIds:
+          - !Ref SubnetId
+        SecurityGroupIds:
+          - !GetAtt ClusterSecurityGroup.GroupId
+      SlurmConfiguration:
+        Accounting:
+          Mode: STANDARD
+        # Enforces the login-node per-student QoS (MaxWall + MaxJobsPerUser),
+        # set via sacctmgr on a follow-up login node. AccountingStorageEnforce
+        # IS in the PCS cluster custom-settings allow-list. DELIBERATELY NO
+        # `AccountingStorageTRES=gres/neuroncore`: `neuroncore` can't be a
+        # GRES/TRES on PCS (Gres is not in the allow-list), so only wall-time /
+        # job-count QoS limits are enforceable (no per-core tracking). See
+        # ../docs/design.md Phase 2, and
+        # https://docs.aws.amazon.com/pcs/latest/userguide/slurm-custom-settings-cluster.html
+        # (+ .../slurm-custom-settings-cng.html for the CNG side below).
+        SlurmCustomSettings:
+          - ParameterName: AccountingStorageEnforce
+            ParameterValue: "associations,limits,qos"
+      # TODO(schema): the CFN reference renders Cluster `Tags` as a bare String
+      # (a doc-gen quirk); AWS::PCS::Queue renders it as a Key:Value map. We use
+      # the map form here for consistency. Drop this block if your CFN endpoint
+      # rejects it.
+      Tags:
+        Class: !Ref ClusterName
+        Purpose: trn-course-pcs
+
+  # ==========================================================================
+  # PCS compute node group: CAPACITY_BLOCK purchase option, the custom launch
+  # template (carrying the capacity-block market option + CR target), the
+  # AWSPCS instance profile, static scaling (min == max), on the CB-AZ subnet.
+  # PCS itself needs ec2:DescribeCapacityReservations / DescribeCapacityBlocks /
+  # DescribeCapacityBlockStatus to manage a CAPACITY_BLOCK node group.
+  # ==========================================================================
+  PcsComputeNodeGroup:
+    Type: AWS::PCS::ComputeNodeGroup
+    Properties:
+      Name: nki-cng
+      ClusterId: !GetAtt PcsCluster.Id
+      AmiId: !Ref PcsAmiId
+      SubnetIds:
+        - !Ref SubnetId
+      PurchaseOption: CAPACITY_BLOCK
+      CustomLaunchTemplate:
+        TemplateId: !Ref ComputeLaunchTemplate
+        # Version must be a String. LatestVersionNumber is a Number, so stringify
+        # it with Fn::Sub. TODO(schema): if your CFN rejects this, pass '1'.
+        Version: !Sub '${ComputeLaunchTemplate.LatestVersionNumber}'
+      IamInstanceProfileArn: !GetAtt ComputeNodeInstanceProfile.Arn
+      ScalingConfiguration:
+        MinInstanceCount: !Ref ComputeNodeCount
+        MaxInstanceCount: !Ref ComputeNodeCount
+      InstanceConfigs:
+        - InstanceType: !Ref ComputeInstanceType
+      # NeuronCore selection on PCS (Phase 2): advertise the node Feature
+      # `neuron,neuroncores<N>` so students select a Trainium node with
+      # `--constraint=neuron` (or the more specific `neuroncores4`/
+      # `neuroncores16`). This is the PCS SUBSTITUTE for the parent
+      # ParallelCluster kit's per-node `Gres=neuroncore:N`: `Features` IS in the
+      # PCS CNG custom-settings allow-list while `Gres`/`GresTypes` are NOT, so
+      # this gives NODE-LEVEL selection only, with no per-core scheduling
+      # isolation. See ../docs/design.md Phase 2 and
+      # https://docs.aws.amazon.com/pcs/latest/userguide/slurm-custom-settings-cng.html
+      # TODO(schema): re-verify the CNG `SlurmConfiguration.SlurmCustomSettings`
+      # property name/casing against the live CFN endpoint, consistent with this
+      # file's other best-effort schema caveats.
+      SlurmConfiguration:
+        SlurmCustomSettings:
+          - ParameterName: Features
+            ParameterValue: !Sub "neuron,neuroncores${NeuronCoresPerNode}"
+      Tags:
+        Class: !Ref ClusterName
+        Purpose: trn-course-pcs
+
+  # ==========================================================================
+  # PCS queue `nki` == the Slurm partition students submit to. Bound to the
+  # compute node group above.
+  # ==========================================================================
+  PcsQueue:
+    Type: AWS::PCS::Queue
+    Properties:
+      Name: nki
+      ClusterId: !GetAtt PcsCluster.Id
+      ComputeNodeGroupConfigurations:
+        - ComputeNodeGroupId: !GetAtt PcsComputeNodeGroup.Id
+      Tags:
+        Class: !Ref ClusterName
+        Purpose: trn-course-pcs
+
+Outputs:
+  ClusterId:
+    Description: PCS cluster id.
+    Value: !GetAtt PcsCluster.Id
+
+  ComputeNodeGroupId:
+    Description: PCS compute node group id.
+    Value: !GetAtt PcsComputeNodeGroup.Id
+
+  QueueName:
+    Description: Slurm partition students submit to.
+    Value: nki
+
+  SecurityGroupId:
+    Description: Self-referencing cluster security group.
+    Value: !GetAtt ClusterSecurityGroup.GroupId
+
+  ComputeNodeInstanceProfileArn:
+    Description: AWSPCS-named instance profile passed to the compute node group.
+    Value: !GetAtt ComputeNodeInstanceProfile.Arn
+
+  LaunchTemplateId:
+    Description: EC2 launch template (capacity-block market + CR target + Neuron user-data).
+    Value: !Ref ComputeLaunchTemplate
+
+  EfsFilesystemId:
+    Description: EFS filesystem backing /shared (mounted on every compute node by the launch-template UserData).
+    Value: !Ref EfsFilesystem
