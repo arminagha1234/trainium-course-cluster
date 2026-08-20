@@ -263,6 +263,44 @@ fresh accounting-enabled cluster:
   - Per-student POSIX user creation and IMDS hardening on the login node (the
     Phase 1 follow-on steps beyond the core `sackd` join).
 
+### Live validation — running a real course assignment (2026-08, sa-east-1)
+
+A follow-on live run on the same cluster (`pcs-trn2-cb-test` / `pcs_4awjpg2se6`,
+node `trn2cb-1` = `trn2.3xlarge` on an ML Capacity Block) exercised the **full
+student loop** — submit → schedule → execute on Trainium — and surfaced a
+correctness gap whose root cause is the compute node's Neuron install, not the
+kernel or the scheduler.
+
+- **Full student loop, end to end.** An `nki` queue was added to the cluster;
+  from the login node `sinfo` showed `nki … idle trn2cb-1` and
+  `srun -p nki hostname` executed on the trn2 compute node. That proves
+  submit → schedule → execute-on-Trainium works on this PCS cluster.
+- **A real NKI kernel compiled and executed on the device.** The worked
+  example's API surface (`@nki.jit`; `nl.load` / `nl.store` / `nl.affine_range`
+  / `nl.arange`; driven via `nki.baremetal` / `nki.benchmark`) **compiled via
+  `neuronx-cc` and ran on the NeuronCore**. Along the way the run hit the
+  genuine NKI error `number of partitions 4096 exceed architecture limitation of
+  128` — i.e. the SBUF 128-partition tiling lesson this example teaches,
+  observed for real when a tile's leading dimension is left un-tiled.
+- **Correctness gap + root cause.** The kernel returned **all-zero output** on a
+  hand-assembled Neuron environment (apt `aws-neuronx-*` + pip `neuronx-cc`,
+  **no `torch-neuronx`**), reproduced across `neuronx-cc` 2.26 and 2.27. The
+  bare proof node also lacked `torch-neuronx` and had too small a root disk to
+  add it. Conclusion: a correct numeric result requires the compute node to run
+  the **validated Neuron DLAMI image** — matched driver + runtime + `neuronx-cc`
+  + `torch-neuronx`, adequate EBS, and the correct trn2 logical-NeuronCore
+  configuration — **not** a from-scratch/partial install.
+- **Actionable kit fix (recommendation).** `bootstrap/neuron-userdata.sh` should
+  prefer the **Neuron DLAMI as the CNG base AMI** (or pin the full matched
+  Neuron release), and the launch template should **size the root EBS volume**
+  explicitly. The current PCS `dlami-base` AMI ships **no Neuron**, which forces
+  the fragile from-scratch install that produced the all-zero output above.
+
+The worked example this run validated lives at
+[`../examples/scale_by_two/`](../examples/scale_by_two/) — a complete,
+runnable "hello, Trainium" kernel to hand students as a "run this first to see
+the flow" before the graded `scale_by_two` stub under `../../harness/`.
+
 ## Notes carried over from the proven run
 
 - The compute node group subnet's **AZ must match the Capacity Block's AZ**;
