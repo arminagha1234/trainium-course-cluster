@@ -1,0 +1,4 @@
+# Python deps for the Gradescope autograder container (installed by setup.sh).
+# gradescope-utils provides the @weight/@number/@partial_credit/@leaderboard
+# decorators, check_submitted_files, and the JSONTestRunner used by run_tests.py.
+gradescope-utils>=0.3.1

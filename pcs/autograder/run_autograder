@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# run_autograder — Gradescope entrypoint for the AWS PCS variant of the
+# Trainium Course Cluster kit.
+#
+# WHAT THIS DOES (and how it differs from the per-instance pattern it adapts)
+# --------------------------------------------------------------------------
+# The UC Berkeley lab6 autograder we take the shape from boots a FRESH trn1 per
+# submission (boto3 run-instances -> ssh -> clone -> scp kernel -> test ->
+# terminate). This one is different on purpose: it targets an ALREADY-RUNNING
+# shared PCS cluster. Per submission it:
+#   1. SSHes to the PCS *login node* (deploy-login-node.sh stood this up),
+#   2. stages the TA assignment + the student's file into a shared-FS run dir,
+#   3. `sbatch --constraint=neuron`s the kit harness onto the shared trn2 fleet,
+#   4. waits for the job, pulls back the harness's result.json,
+#   5. hands that result.json to run_tests.py, which writes Gradescope results.
+#
+# WHY THIS IS BETTER HERE:
+#   * No per-submission EC2 — it reuses the ML Capacity Block you already pay
+#     for, and Slurm fair-shares concurrent submissions across the fleet.
+#   * No AWS credentials in the Gradescope image — the ONLY secret baked in is a
+#     scoped SSH key to a low-privilege login-node user that may `sbatch`.
+#   * Single source of truth — grading reuses the kit's harness/test_kernel.py
+#     and its result.json schema (harness/result_writer.py), not a fork.
+#
+# HONEST STATUS: this wires the documented pieces together; it has not been run
+# end to end on Gradescope yet (see README.md). Content on AWS PCS behavior was
+# summarized from AWS docs and rephrased for compliance with licensing terms.
+
+# NOTE: intentionally `set -uo pipefail` but NOT `-e`. We want to survive a
+# failed SSH/scp/sbatch and still synthesize a result + run run_tests.py, so
+# Gradescope always shows the student *something* actionable rather than a
+# silent container error.
+set -uo pipefail
+
+# ============================================================================
+# Operator configuration — EDIT THESE. (Kept at the top, mirroring how the
+# lab6 autograder keeps its launch vars up front.)
+# ============================================================================
+LOGIN_NODE_HOST="<login-node public DNS/IP>"    # from deploy-login-node.sh output ("SSH hint")
+LOGIN_NODE_USER="autograder"                     # low-priv user on the login node that may sbatch
+SSH_KEY="/autograder/source/autograder_key.pem"  # scoped login-node SSH key, baked into the image (NOT AWS keys)
+ASSIGNMENT="scale_by_two"                         # which /shared/assignments/<name> to grade against
+SUBMISSION_FILE="student.py"                      # the file students upload
+HARNESS_DIR="/shared/harness"                     # kit harness on the cluster (staged by deploy)
+ASSIGNMENTS_DIR="/shared/assignments"             # TA assignment dirs on the cluster
+JOB_TIMEOUT=300                                   # seconds to wait for the grading job before giving up
+
+# Gradescope's fixed locations (do not usually need editing).
+SUBMISSION_DIR="/autograder/submission"           # where Gradescope drops the student's upload
+SOURCE_DIR="/autograder/source"                   # where this script + the baked key live
+RESULT_LOCAL="${SOURCE_DIR}/result.json"          # where we land the harness result for run_tests.py
+
+# ============================================================================
+# SSH / SCP helpers — one place for the connection flags so every remote call
+# is consistent. StrictHostKeyChecking=no because the login node's host key is
+# not known to the ephemeral Gradescope container; ConnectTimeout keeps a dead
+# host from hanging the whole grade.
+# ============================================================================
+SSH_OPTS=(-i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 -o BatchMode=yes)
+REMOTE="${LOGIN_NODE_USER}@${LOGIN_NODE_HOST}"
+
+run_ssh() { ssh "${SSH_OPTS[@]}" "${REMOTE}" "$@"; }
+run_scp() { scp "${SSH_OPTS[@]}" "$@"; }
+
+# write_fatal_result <notes> — synthesize a minimal result.json locally so
+# run_tests.py can still report a clean FAIL to the student. Matches the subset
+# of the harness schema (harness/result_writer.py) that the tests read.
+write_fatal_result() {
+  local notes="$1"
+  # Sanitize for safe embedding in a JSON string literal: drop backslashes and
+  # double quotes, collapse newlines/tabs to spaces. A diagnostic message must
+  # never produce invalid JSON (run_tests.py would otherwise report a less
+  # helpful parse error instead of this reason).
+  notes="${notes//\\/ }"
+  notes="${notes//\"/ }"
+  notes="${notes//$'\n'/ }"
+  notes="${notes//$'\t'/ }"
+  mkdir -p "${SOURCE_DIR}"
+  cat > "${RESULT_LOCAL}" <<JSON
+{
+  "schema_version": 1,
+  "job_id": "autograder",
+  "assignment": "${ASSIGNMENT}",
+  "correctness": {
+    "passed": false,
+    "notes": "${notes}"
+  },
+  "timing": {}
+}
+JSON
+  echo "[autograder] wrote fatal result.json: ${notes}" >&2
+}
+
+# run_tests — always the last thing we do, on every exit path.
+finish() {
+  echo "[autograder] scoring with run_tests.py"
+  cd "${SOURCE_DIR}" && python3 run_tests.py
+  exit 0
+}
+
+echo "[autograder] start $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "[autograder] login=${REMOTE} assignment=${ASSIGNMENT} harness=${HARNESS_DIR} timeout=${JOB_TIMEOUT}s"
+
+# ----------------------------------------------------------------------------
+# 0. Lock down the private key. Gradescope unzips the image world-readable;
+#    ssh refuses a key that is group/other-readable, so tighten it first.
+# ----------------------------------------------------------------------------
+if [[ ! -f "${SSH_KEY}" ]]; then
+  write_fatal_result "autograder misconfigured: SSH key ${SSH_KEY} not found in the image (operator must bake it in)"
+  finish
+fi
+chmod 400 "${SSH_KEY}" 2>/dev/null || true
+
+# ----------------------------------------------------------------------------
+# 1. Confirm the student actually submitted the expected file. (The graded
+#    test_files.py also checks this, but failing fast here avoids a pointless
+#    round trip to the cluster.)
+# ----------------------------------------------------------------------------
+if [[ ! -f "${SUBMISSION_DIR}/${SUBMISSION_FILE}" ]]; then
+  write_fatal_result "no submission found: expected ${SUBMISSION_FILE} in the uploaded files"
+  finish
+fi
+
+# ----------------------------------------------------------------------------
+# 2. Unique run dir on the cluster's shared FS. Everything for this submission
+#    (TA files + student file + result.json + slurm .out) lives under here so
+#    cleanup is a single rm -rf. $RANDOM disambiguates two submissions that land
+#    in the same second.
+# ----------------------------------------------------------------------------
+RUN_DIR="/shared/autograder/runs/$(date +%s)-${RANDOM}"
+echo "[autograder] run dir: ${RUN_DIR}"
+if ! run_ssh "mkdir -p '${RUN_DIR}'"; then
+  write_fatal_result "could not reach the login node (${REMOTE}) to create a run dir; check LOGIN_NODE_HOST, the SSH key, and the login SG"
+  finish
+fi
+
+# ----------------------------------------------------------------------------
+# 3. Populate the run dir.
+#    (a) Copy the TA assignment's reference/inputs/tolerance from
+#        $ASSIGNMENTS_DIR/$ASSIGNMENT into $RUN_DIR. reference.py is expected;
+#        inputs.py and tolerance.json are optional (the harness has defaults),
+#        so we copy whichever exist. $f is escaped so it expands on the login
+#        node, not locally.
+#    (b) scp the student's submission in as student.py LAST, so it overwrites
+#        any stray student.py from the TA dir. This guarantees the graded
+#        student.py is the upload and reference.py is the TA's.
+# ----------------------------------------------------------------------------
+run_ssh "src='${ASSIGNMENTS_DIR}/${ASSIGNMENT}'; \
+         for f in reference.py inputs.py tolerance.json; do \
+           if [ -f \"\$src/\$f\" ]; then cp \"\$src/\$f\" '${RUN_DIR}/'; fi; \
+         done" \
+  || echo "[autograder] WARN: copying TA assignment files reported an error; the harness may fall back to defaults" >&2
+
+if ! run_scp "${SUBMISSION_DIR}/${SUBMISSION_FILE}" "${REMOTE}:${RUN_DIR}/student.py"; then
+  write_fatal_result "failed to upload the student submission to the cluster run dir"
+  run_ssh "rm -rf '${RUN_DIR}'" 2>/dev/null || true
+  finish
+fi
+
+# ----------------------------------------------------------------------------
+# 4. Stage the sbatch script next to the run dir, then submit it. We pass
+#    $RUN_DIR (assignment dir == output dir) and $HARNESS_DIR as $1/$2 to the
+#    job. `sbatch --parsable` prints just "<jobid>" (or "<jobid>;<cluster>"),
+#    which we split on ';'. We cd into $RUN_DIR first so the job's %x-%j.out
+#    lands under the run dir and is cleaned up with it.
+# ----------------------------------------------------------------------------
+if ! run_scp "${SOURCE_DIR}/grade_job.sbatch" "${REMOTE}:${RUN_DIR}/grade_job.sbatch"; then
+  write_fatal_result "failed to stage grade_job.sbatch onto the login node"
+  run_ssh "rm -rf '${RUN_DIR}'" 2>/dev/null || true
+  finish
+fi
+
+SBATCH_OUT="$(run_ssh "cd '${RUN_DIR}' && sbatch --parsable grade_job.sbatch '${RUN_DIR}' '${HARNESS_DIR}'")"
+JOBID="${SBATCH_OUT%%;*}"   # strip any ";<clustername>" suffix --parsable can add
+if [[ -z "${JOBID}" || ! "${JOBID}" =~ ^[0-9]+$ ]]; then
+  write_fatal_result "sbatch did not return a job id (got: '${SBATCH_OUT}'); is the 'nki' partition present and can ${LOGIN_NODE_USER} submit?"
+  run_ssh "rm -rf '${RUN_DIR}'" 2>/dev/null || true
+  finish
+fi
+echo "[autograder] submitted job ${JOBID}"
+
+# ----------------------------------------------------------------------------
+# 5. Poll squeue until the job leaves the queue or JOB_TIMEOUT elapses.
+#    `squeue -h -j <id>` prints nothing once the job is gone (completed,
+#    failed, or cancelled). A short initial sleep avoids a start-up race where
+#    squeue has not registered a just-submitted job yet.
+# ----------------------------------------------------------------------------
+sleep 3
+DEADLINE=$(( $(date +%s) + JOB_TIMEOUT ))
+while true; do
+  if (( $(date +%s) >= DEADLINE )); then
+    echo "[autograder] job ${JOBID} exceeded ${JOB_TIMEOUT}s; cancelling" >&2
+    run_ssh "scancel ${JOBID}" 2>/dev/null || true
+    write_fatal_result "grading job timed out after ${JOB_TIMEOUT}s (cluster busy or job stuck); try resubmitting"
+    run_ssh "rm -rf '${RUN_DIR}'" 2>/dev/null || true
+    finish
+  fi
+  # A transient SSH blip should not end grading; treat an SSH error as "still
+  # running" and let the deadline decide.
+  QSTATE="$(run_ssh "squeue -h -j ${JOBID} 2>/dev/null")"
+  SSH_RC=$?
+  if [[ ${SSH_RC} -eq 0 && -z "${QSTATE//[[:space:]]/}" ]]; then
+    echo "[autograder] job ${JOBID} left the queue"
+    break
+  fi
+  sleep 5
+done
+
+# ----------------------------------------------------------------------------
+# 6. Pull the harness result.json back. The harness writes it to $RUN_DIR
+#    regardless of pass/fail; a missing file means the job died before the
+#    harness ran (bad node env, import crash, etc.), which is a fatal grade.
+# ----------------------------------------------------------------------------
+if ! run_scp "${REMOTE}:${RUN_DIR}/result.json" "${RESULT_LOCAL}"; then
+  write_fatal_result "no result.json produced by the grading job (the job may have failed before the harness ran; check the compute node's Neuron env)"
+  run_ssh "rm -rf '${RUN_DIR}'" 2>/dev/null || true
+  finish
+fi
+echo "[autograder] fetched result.json"
+
+# ----------------------------------------------------------------------------
+# 7. Best-effort cleanup of the shared-FS run dir (non-fatal).
+# ----------------------------------------------------------------------------
+run_ssh "rm -rf '${RUN_DIR}'" 2>/dev/null || echo "[autograder] WARN: could not remove ${RUN_DIR}; clean it up out of band" >&2
+
+# ----------------------------------------------------------------------------
+# 8. Score it.
+# ----------------------------------------------------------------------------
+finish

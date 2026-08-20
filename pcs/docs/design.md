@@ -295,6 +295,16 @@ kernel or the scheduler.
   Neuron release), and the launch template should **size the root EBS volume**
   explicitly. The current PCS `dlami-base` AMI ships **no Neuron**, which forces
   the fragile from-scratch install that produced the all-zero output above.
+- **Cross-checked against the UC Berkeley CS152 lab6 autograder.** That lab's
+  per-instance Trainium autograder runs its grader from the **Neuron DLAMI venv**
+  (it sources `/opt/aws_neuronx_venv_pytorch_2_9`), independently confirming the
+  finding above: the compute/grading image must be the full matched Neuron
+  install, not a from-scratch one. The PCS autograder's
+  [`../autograder/grade_job.sbatch`](../autograder/grade_job.sbatch) sources
+  `/opt/aws_neuronx_venv_pytorch` accordingly, and — unlike the per-instance
+  pattern — submits onto the shared cluster via the login node and reuses the
+  kit harness `result.json` schema for scoring (see
+  [`../autograder/README.md`](../autograder/README.md)).
 
 The worked example this run validated lives at
 [`../examples/scale_by_two/`](../examples/scale_by_two/) — a complete,

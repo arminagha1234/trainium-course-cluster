@@ -189,11 +189,29 @@ pcs/
   slurm/
     job-templates/
       run.sh                   PCS job template (#SBATCH --constraint=neuron, not --gres)
+  autograder/                  Gradescope autograder: ssh+sbatch to the shared cluster, reuse the kit harness
+    run_autograder             entrypoint (ssh login node -> sbatch grade_job.sbatch -> pull result.json)
+    grade_job.sbatch           the Slurm job (runs harness/test_kernel.py on a trn2 node)
+    run_tests.py               gradescope-utils runner -> results.json
+    tests/                     correctness (70) + performance (30) + leaderboard, from result.json
+    setup.sh / requirements.txt image build + deps
   infra/
     pcs.yaml                   CloudFormation mirror incl. EFS (best-effort; not deploy-validated)
   docs/
     design.md                  PC->PCS mapping + PHASE STATUS (login node, GRES, accounting, EFS)
 ```
+
+## Autograding (Gradescope)
+
+`autograder/` adds an optional Gradescope autograder for this variant. Rather
+than booting a Trainium instance per submission, it SSHes to the **PCS login
+node** and `sbatch --constraint=neuron`s each grading run onto the
+already-running shared trn2 fleet, reusing the kit harness and its `result.json`
+schema. The only secret baked into the Gradescope image is a **scoped SSH key**
+to a low-privilege `autograder` login-node user that may `sbatch` — **no AWS
+credentials**. See [`autograder/README.md`](./autograder/README.md) for operator
+setup, the 70/30 correctness/performance breakdown, and the honest
+not-yet-run-on-Gradescope status.
 
 ## Reuse from the parent kit
 
