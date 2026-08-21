@@ -1,116 +1,112 @@
 # Trainium Course Cluster (AWS PCS)
 
-An infrastructure kit that stands up a shared Trainium Slurm cluster for NKI
-kernel assignments on **AWS Parallel Computing Service (PCS)**, backed by a
-pre-purchased ML Capacity Block (CB). PCS provides a managed Slurm controller,
-so this kit hands PCS a launch template + IAM + networking and PCS owns the
-scheduler lifecycle. It implements the design in [`PRD.md`](./PRD.md).
+An open-source infrastructure kit for running hands-on AWS Trainium coursework,
+such as NKI kernel assignments, on a shared Slurm cluster. An instructor
+supplies a small set of inputs and pre-purchased capacity; the kit provisions
+the cluster, creates per-student login accounts, and returns a roster. Students
+SSH in, edit their kernel code, and submit jobs to Trainium nodes with `sbatch`.
 
-The `harness/` (correctness + profiling) and `lambda/`
-(`student_manifest`, `kill_switch`, `auto_teardown`) directories are shared
-components consumed by this kit; see
-[Shared components](#shared-components-harness-and-lambda).
+The cluster runs on AWS Parallel Computing Service (PCS), which provides a
+managed Slurm controller, so the kit hands PCS the networking, IAM, and a
+launch template, and PCS owns the scheduler lifecycle. The full requirements
+and design rationale are in [`PRD.md`](./PRD.md).
 
-> **Status: proven core + Phases 1–4 implemented; the login-node join (Phase 1)
-> and the NeuronCore-gres finding (Phase 2) are now validated on live hardware.**
-> `scripts/deploy-pcs.sh` reproduces the proven core (security group → AWSPCS
-> IAM role → PCS AMI → launch template → PCS cluster → compute node group →
-> queue) and now also provisions **EFS `/shared`** and the Phase-2 node
-> `Features` + cluster `AccountingStorageEnforce`. A standalone **login node**
-> (`scripts/deploy-login-node.sh` + `bootstrap/login-node-setup.sh`) adds
-> student SSH, **per-student POSIX users**, and **wall-time + concurrent-job
-> QoS** via `sacctmgr` — rounding out Phases 1–4. A live run (sa-east-1, cluster
-> `pcs-trn2-cb-test`, node `trn2cb-1` = `trn2.3xlarge` on an ML Capacity Block)
-> confirmed the **login node joins the managed Slurm controller via `sackd`**
-> (after which `sinfo`/`scontrol` query the controller) and that the
-> **PCS-managed node reports `Gres=(null)`** — empirically proving there is no
-> per-core NeuronCore scheduling on PCS. **Phase 3** (per-student QoS; needs a
-> cluster created with managed accounting) and **Phase 4** (EFS `/shared`) are
-> implemented but **not yet exercised on a live cluster.** One limitation is
-> structural, not merely unproven, and is now **confirmed live**: **`neuroncore`
-> cannot be a Slurm GRES on PCS** (it is in neither custom-settings allow-list,
-> and the live node advertises no gres), so there is **no per-core scheduling and
-> no per-core / core-hours budget** — students select whole nodes with
-> `--constraint=neuron`, and limits are wall-time + job-count only. See
-> [`docs/design.md`](./docs/design.md) "PHASE STATUS" (Phase 2) for details.
+For step-by-step instructions see the [`USER-GUIDE.md`](./USER-GUIDE.md);
+this README is the project overview.
 
-## The proven result
+## Who this is for
 
-The load-bearing question for this variant was whether PCS would launch a
-Trainium instance from an **ML Capacity Block** at all — the PCS documentation
-lists Capacity Blocks as being for P-family GPU instances (P6/P5/P4d), with no
-mention of Trn. It was validated empirically via the AWS CLI:
+Research and education customers standing up short-lived Trainium clusters for a
+class, workshop, bootcamp, or hackathon. There are three roles:
 
-- **Instance `i-04fdfe05274edb571`** came up as a **`trn2.3xlarge`**
-- with **`InstanceLifecycle=capacity-block`**
-- drawing from the Trainium ML Capacity Block **`cr-0e168cd22e5919f69`**
-- under **AWS PCS management** (PCS-tagged, launched by the PCS compute node
-  group via the custom launch template).
+- Admin: owns the AWS account, the capacity, and cost guardrails.
+- Instructor or TA: deploys and tears down the cluster, manages the roster, sets
+  per-student limits, and monitors usage.
+- Student: logs in, writes kernel code, submits jobs, and reads results and
+  profiles from a personal working directory.
 
-So the trn2-on-a-Capacity-Block-via-PCS path works in practice. `deploy-pcs.sh`
-codifies the exact sequence and field values that produced that result.
+## What you get
 
-## ⚠️ Caveat: works, but officially unsupported
+- A managed Slurm control plane via PCS (no head node to operate).
+- Trainium compute from either a trn2 ML Capacity Block or on-demand trn1.
+- Per-student POSIX accounts with isolated home and work directories on a shared
+  EFS filesystem that survives teardown.
+- A correctness-and-profiling harness plus a worked example assignment.
+- An optional Gradescope autograder.
+- One-command deploy, and teardown that preserves student work.
 
-AWS PCS documentation for Capacity Blocks describes the feature in terms of
-**P6 / P5 / P4d** GPU instances and does not list Trainium (`trn`) types. The
-result above shows trn2 **does** work, but you are outside the documented
-support matrix:
+## What it is not
 
-- AWS could change PCS's Capacity Block handling in a way that breaks trn2
-  without it being a "regression" against documented behavior.
-- Support may decline to engage on trn2-on-PCS-CB issues.
-- **No per-NeuronCore scheduling on PCS.** `neuroncore` can't be a Slurm GRES
-  on PCS — it is in neither the CNG nor the cluster custom-settings allow-list —
-  so there is **no per-core scheduling** and **no per-core / core-hours
-  budget**. This is now **confirmed on a live PCS trn2 node**: `scontrol show
-  node trn2cb-1` reports **`Gres=(null)`** (the managed node advertises no gres,
-  with no autodetect fallback), so it is not merely inferred from the docs.
-  Nodes are selected whole with `--constraint=neuron` (use `--exclusive` for
-  isolation), and per-student limits are wall-time + concurrent-job-count only.
-  A course that needs multiple students sharing one node at NeuronCore
-  granularity is not achievable on PCS today. See
-  [`docs/design.md`](./docs/design.md) "PHASE STATUS" (Phase 2).
-- Treat this as **"works but officially unsupported."** Validate again on your
-  own account/region before relying on it for a live class.
-- **The on-demand / trn1 path (`--purchase-option ONDEMAND`) is code-complete
-  but not yet live-validated.** The proven run above was trn2-on-a-Capacity-Block;
-  the ONDEMAND branch (plain launch template, no CR target, AZ derived from the
-  subnet) and the trn1 NeuronCore-count labels (`trn1.2xlarge=2`,
-  `trn1.32xlarge=32`) have not been exercised end-to-end. The `neuroncores<N>`
-  value is only an informational node Feature on PCS (no per-core scheduling
-  either way), so a wrong count would not break scheduling. Validate on your own
-  account before a live class.
+- Not an autograder-by-default or a submission portal (grading is via provided
+  scripts; the Gradescope autograder is optional).
+- Not a multi-node or EFA distributed-training setup (single-node kernel work).
+- Not a long-lived cluster (it lives for the capacity window; EFS persists).
 
-## How to deploy
+## How it works
 
-The compute fleet can be either a **trn2 ML Capacity Block**
-(`--purchase-option CAPACITY_BLOCK`, the default and the live-proven path) or
-**on-demand Trainium such as trn1** (`--purchase-option ONDEMAND`, no Capacity
-Block required). Pick the path that matches your capacity.
+The kit provisions two layers. Account scaffolding: a self-referencing security
+group, an `AWSPCS`-named IAM role and instance profile, an EFS filesystem for
+`/shared`, and an EC2 launch template carrying the Neuron install user-data. The
+PCS layer: a managed Slurm cluster, a compute node group backed by the launch
+template, and a queue (`nki`) that maps to the Slurm partition students submit
+to.
 
-Prereqs: AWS CLI v2 (with the `pcs` commands), `jq`, `base64`, and a private
-subnet in the compute AZ. The deploying identity needs the usual
-`ec2`/`iam`/`ssm`/`pcs` create permissions; for the CAPACITY_BLOCK path it also
-needs `ec2:DescribeCapacityReservations` (and PCS itself needs
-`ec2:DescribeCapacityBlocks` + `ec2:DescribeCapacityBlockStatus` — see
-`docs/design.md`). Supported regions: `sa-east-1`, `us-east-2` (trn2 MLCB homes)
-and `us-east-1`, `us-west-2` (trn1 on-demand).
+```
+  instructor ── deploy-pcs.sh ─┐
+                               ├─> PCS cluster (managed Slurm controller)
+                               ├─> compute node group ── Trainium nodes (trn2 CB or trn1 on-demand)
+                               │        each node: public Neuron SDK + torch-neuronx in a shared venv,
+                               │                   EFS mounted at /shared
+                               └─> queue "nki"  (partition; select nodes with --constraint=neuron)
 
-**Option A — trn2 ML Capacity Block (default):**
+  students ── ssh ──> login node ── sbatch ──> queue "nki" ──> Trainium node
+                        (per-student accounts; /shared/home + /shared/work on EFS)
+```
+
+Compute nodes install the public Neuron SDK and `torch-neuronx` into a shared
+virtual environment at `/opt/aws_neuronx_venv_pytorch` and mount EFS at
+`/shared`. Because PCS has no head node, a separate login node gives students a
+place to `ssh` in and submit from.
+
+## Compute options
+
+The `--purchase-option` flag selects the capacity model:
+
+- `CAPACITY_BLOCK` (default): a trn2 ML Capacity Block. Requires a capacity
+  reservation id and a subnet in the reservation's AZ. This is the path that has
+  been validated most.
+- `ONDEMAND`: on-demand Trainium such as `trn1.2xlarge`, `trn1.32xlarge`, or
+  `trn1n.32xlarge`. No Capacity Block is required; the compute AZ is derived from
+  the subnet. Supported regions include `us-east-1` and `us-west-2`.
+
+Supported regions: `sa-east-1` and `us-east-2` for trn2 Capacity Blocks;
+`us-east-1` and `us-west-2` for on-demand trn1.
+
+## Quick start
+
+On-demand trn1 (no Capacity Block):
+
 ```bash
-# 1. Find the Capacity Block id + AZ:
-aws ec2 describe-capacity-reservations \
-  --filters Name=instance-type,Values=trn2.3xlarge Name=state,Values=active \
-  --query 'CapacityReservations[].{Id:CapacityReservationId,AZ:AvailabilityZone,Count:TotalInstanceCount}' \
-  --region us-east-2
-
-# 2. Deploy (validation first; the script waits for each PCS resource to reach ACTIVE):
 ./scripts/deploy-pcs.sh \
-  --cluster-name fall26-nki-pcs \
+  --cluster-name fall26-nki \
+  --region us-west-2 \
+  --purchase-option ONDEMAND \
+  --subnet-id subnet-xxxxxxxx \
+  --vpc-id vpc-xxxxxxxx \
+  --compute-instance-type trn1.2xlarge \
+  --compute-node-count 2 \
+  --student-count 20 \
+  --alert-email you@your.org
+```
+
+trn2 ML Capacity Block:
+
+```bash
+./scripts/deploy-pcs.sh \
+  --cluster-name fall26-nki \
   --region us-east-2 \
   --purchase-option CAPACITY_BLOCK \
-  --capacity-reservation-id cr-0e168cd22e5919f69 \
+  --capacity-reservation-id cr-xxxxxxxx \
   --availability-zone us-east-2b \
   --subnet-id subnet-xxxxxxxx \
   --vpc-id vpc-xxxxxxxx \
@@ -120,161 +116,83 @@ aws ec2 describe-capacity-reservations \
   --alert-email you@your.org
 ```
 
-**Option B — on-demand trn1 (no Capacity Block):**
-```bash
-./scripts/deploy-pcs.sh \
-  --cluster-name fall26-nki-trn1 \
-  --region us-west-2 \
-  --purchase-option ONDEMAND \
-  --subnet-id subnet-xxxxxxxx \
-  --vpc-id vpc-xxxxxxxx \
-  --compute-instance-type trn1.32xlarge \
-  --compute-node-count 1 \
-  --student-count 20 \
-  --alert-email you@your.org
-```
-
-With `ONDEMAND`, `--capacity-reservation-id` and `--availability-zone` are not
-needed: the compute AZ is derived from `--subnet-id`. Add `--dry-run` to run all
-validation and stop before creating any resources.
-
-What the script creates, in order:
-
-1. **Security group** — self-referencing (all traffic within itself) + all
-   egress. This is the SG shape PCS requires for the cluster ENI.
-2. **IAM role + instance profile** — the role **name starts with `AWSPCS`**
-   (PCS rejects a non-`AWSPCS` role with "The role ARN is invalid"). Trusts
-   `ec2.amazonaws.com`; carries `AWSPCSComputeNodePolicy`,
-   `AmazonSSMManagedInstanceCore`, `AmazonS3ReadOnlyAccess`, and
-   `CloudWatchAgentServerPolicy`.
-3. **PCS AMI** — resolved from SSM
-   (`/aws/service/pcs/ami/dlami-base-ubuntu2404/x86_64/latest/ami-id`).
-4. **Launch template** — `InstanceMarketOptions.MarketType=capacity-block`,
-   `CapacityReservationSpecification` → the CB, the SG, and base64 UserData =
-   [`bootstrap/neuron-userdata.sh`](./bootstrap/neuron-userdata.sh) (the Neuron
-   SDK + `torch-neuronx` install).
-5. **PCS cluster** — Slurm **25.11** (24.11 is EOL), size `SMALL`, managed
-   accounting (`accounting mode STANDARD`).
-6. **PCS compute node group** — `purchaseOption=CAPACITY_BLOCK`, the custom
-   launch template, the `AWSPCS` instance profile, static scaling, subnet in
-   the CB AZ.
-7. **PCS queue `nki`** — the Slurm partition students submit to
-   (queue == partition).
-
-`deploy-pcs.sh` now also creates an **EFS filesystem + mount target** on the
-cluster SG and injects its id into the compute UserData (pass an existing one
-with `--efs-id` to skip creation), and applies the Phase-2 settings (node
-`Features=neuron,neuroncoresN` on the CNG and `AccountingStorageEnforce` on the
-cluster). `infra/pcs.yaml` is a best-effort CloudFormation mirror of these
-resources (now including EFS). It is **not** deploy-validated — the proven path
-is the CLI script. See its header for the schema caveats.
-
-### Then: the login node (student SSH + per-student accounting)
-
-PCS has no head node, so students need a **login node** to `ssh` into and
-`sbatch` from. Once the cluster is `ACTIVE`, run `scripts/deploy-login-node.sh`
-(Phase 1 + Phase 3):
-
-```bash
-./scripts/deploy-login-node.sh \
-  --cluster-name fall26-nki-pcs \
-  --region us-east-2 \
-  --vpc-id vpc-xxxxxxxx \
-  --subnet-id subnet-xxxxxxxx \
-  --ssh-allowed-cidr 203.0.113.0/24 \
-  --key-name my-ssh-key \
-  --efs-id fs-xxxxxxxx \
-  --staging-bucket my-bootstrap-bucket
-```
-
-This launches a standalone EC2 instance in the cluster VPC/subnet, attaches it
-to the cluster SG, joins it to the managed cluster as a submit host via `sackd`,
-mounts the same EFS at `/shared`, creates the per-student POSIX users, and runs
-`sacctmgr` for the per-student wall-time + concurrent-job QoS. `--ssh-allowed-cidr`
-restricts TCP/22 to the course network (never an open range), and the box
-hardens IMDS (IMDSv2 + an iptables owner-match rule) because students get shells
-on it. Students then SSH to the login node and submit with
-**`sbatch --constraint=neuron`** — not `--gres=neuroncore:N`, which does not
-schedule on PCS (see the caveat above and `docs/design.md` "PHASE STATUS"
-Phase 2). The **`sackd` join was validated live** (sa-east-1; the login node
-reached the managed controller and `sinfo`/`scontrol` worked); the per-student
-users + `sacctmgr` QoS steps are **implemented but not yet exercised end-to-end**
-(that needs a cluster created with managed accounting — see `docs/design.md`
-Phase 3). The deploy script was **hardened after live testing**: it stages
-`login-node-setup.sh` to S3 and boots from a tiny fetch-and-run UserData (the
-rendered setup script is ~24 KB, over EC2's 16 KB user-data limit), and its
-`run-instances` retries on the IAM instance-profile propagation race.
+Add `--dry-run` to validate inputs without creating resources. After the
+cluster is up, add a login node and hand out accounts; see
+[`USER-GUIDE.md`](./USER-GUIDE.md) for the full instructor and student
+workflow.
 
 ## Repo layout
 
 ```
 trainium-course-cluster/
-  README.md                    you are here
+  README.md                    project overview (this file)
+  USER-GUIDE.md                instructor, TA, and student instructions
   PRD.md                       product requirements (V0)
   scripts/
-    deploy-pcs.sh              proven core + EFS + Phase-2 Features/accounting (aws ec2 + iam + ssm + pcs + efs)
-    deploy-login-node.sh       Phase 1+3: standalone sackd login node (student SSH, POSIX users, sacctmgr)
+    deploy-pcs.sh              provision the PCS cluster + compute + EFS
+    deploy-login-node.sh       add a login node (student SSH, accounts, QoS)
   bootstrap/
-    neuron-userdata.sh         compute UserData: public Neuron SDK + torch-neuronx; mounts EFS /shared
-    login-node-setup.sh        login-node config: sackd join, per-student users, IMDS hardening, sacctmgr
-  slurm/
-    job-templates/
-      run.sh                   PCS job template (#SBATCH --constraint=neuron, not --gres)
-  autograder/                  Gradescope autograder: ssh+sbatch to the shared cluster, reuse the kit harness
-    run_autograder             entrypoint (ssh login node -> sbatch grade_job.sbatch -> pull result.json)
-    grade_job.sbatch           the Slurm job (runs harness/test_kernel.py on a trn2 node)
-    run_tests.py               gradescope-utils runner -> results.json
-    tests/                     correctness (70) + performance (30) + leaderboard, from result.json
-    setup.sh / requirements.txt image build + deps
-  infra/
-    pcs.yaml                   CloudFormation mirror incl. EFS (best-effort; not deploy-validated)
-  docs/
-    design.md                  design + PHASE STATUS (login node, GRES, accounting, EFS)
-  harness/                     shared: correctness (test_kernel.py) + profiling (profile_kernel.py) + result schema + example assignment
-  lambda/                      shared: student_manifest (POSIX users + keys + TA manifest), kill_switch (budget), auto_teardown (end-of-block)
+    neuron-userdata.sh         compute-node user-data: Neuron SDK + /shared mount
+    login-node-setup.sh        login-node config: sackd join, users, sacctmgr
+  slurm/job-templates/run.sh   sbatch template (--constraint=neuron)
+  harness/                     correctness + profiling harness, example assignment
+  autograder/                  optional Gradescope autograder
+  infra/pcs.yaml               CloudFormation mirror of the deploy (best-effort)
+  docs/design.md               architecture, phase status, live-validation notes
 ```
 
-## Autograding (Gradescope)
+## Current status
 
-`autograder/` adds an optional Gradescope autograder for this variant. Rather
-than booting a Trainium instance per submission, it SSHes to the **PCS login
-node** and `sbatch --constraint=neuron`s each grading run onto the
-already-running shared trn2 fleet, reusing the kit harness and its `result.json`
-schema. The only secret baked into the Gradescope image is a **scoped SSH key**
-to a low-privilege `autograder` login-node user that may `sbatch` — **no AWS
-credentials**. See [`autograder/README.md`](./autograder/README.md) for operator
-setup, the 70/30 correctness/performance breakdown, and the honest
-not-yet-run-on-Gradescope status.
+Validated live on real hardware:
 
-## Shared components (`harness/` and `lambda/`)
+- On-demand trn1 end to end (`us-west-2`, 2x `trn1.2xlarge`): cluster and node
+  group reach ACTIVE, `neuron-ls` sees the device, the shared venv imports
+  `torch-neuronx`, a kernel compiles and runs on the NeuronCore, and EFS
+  `/shared` mounts with the student directory skeleton.
+- PCS on a trn2 ML Capacity Block: the core provisioning path.
+- The login node joins the managed Slurm controller via `sackd`.
 
-The cluster control plane is PCS-specific, but two directories are
-control-plane-agnostic and are consumed as-is:
+Implemented but not yet exercised end to end:
 
-- **Lambdas** — `lambda/student_manifest` (per-student POSIX users + SSH
-  keypairs + TA manifest), `lambda/kill_switch` (budget kill-switch), and
-  `lambda/auto_teardown` (end-of-block teardown).
-- **Harness** — `harness/` (`test_kernel.py`, `profile_kernel.py`,
-  `result_writer.py`, and the example assignment) for correctness + profiling.
+- Per-student POSIX accounts and `sacctmgr` per-student QoS (wall-time and
+  concurrent-job limits).
+- The `student_manifest` roster automation wired into the PCS flow.
+- Managed Slurm accounting, which requires a recent AWS CLI; on older CLIs the
+  deploy falls back to a cluster without accounting and per-student QoS
+  enforcement is unavailable until the CLI is upgraded.
 
-The Slurm job template ships in `slurm/job-templates/run.sh` and selects nodes
-with `--constraint=neuron` (not `--gres=neuroncore:N`, which does not schedule
-on PCS — see the caveat above and `docs/design.md` "PHASE STATUS" Phase 2). It
-sources the shared `/opt/aws_neuronx_venv_pytorch` venv that
-`neuron-userdata.sh` builds.
+## Limitations
 
-Phases 1–4 wire the login node (student SSH + per-student POSIX users +
-`sacctmgr` QoS), EFS `/shared`, and wall-time / job-count accounting into the
-PCS deploy — all **implemented but not yet live-validated**. Still open (not yet
-wired): the `student_manifest` Lambda as the roster source, and the
-`kill_switch` / `auto_teardown` budget + end-of-block teardown stacks. See
-[`docs/design.md`](./docs/design.md) "PHASE STATUS" for status per phase.
+- No per-NeuronCore scheduling on PCS. `neuroncore` cannot be a Slurm GRES on
+  PCS, so students select whole nodes with `--constraint=neuron` (use
+  `--exclusive` for sole use). Multiple students sharing one node at NeuronCore
+  granularity is not available. See [`docs/design.md`](./docs/design.md) Phase 2.
+- trn2 on a Capacity Block via PCS works but is outside AWS's documented support
+  matrix (the PCS docs list Capacity Blocks for P-family GPUs). Validate on your
+  own account before relying on it for a live class.
+- On-demand trn1 is validated for the compute path but has not been run at
+  full class scale.
+
+## Security posture
+
+- The login node is the only ingress; its SSH is restricted to a CIDR you
+  supply (never an open range), and it enforces IMDSv2.
+- Compute nodes sit in the cluster VPC on a self-referencing security group.
+- Students get no sudo and isolated home and work directories; per-student SSH
+  keys are stored in AWS Secrets Manager, not in plaintext outputs.
+
+## Documentation
+
+- [`USER-GUIDE.md`](./USER-GUIDE.md): instructor, TA, and student instructions.
+- [`docs/design.md`](./docs/design.md): architecture, phase status, and
+  live-validation notes.
+- [`PRD.md`](./PRD.md): product requirements.
 
 ## References
 
-- AWS PCS Capacity Blocks: [docs.aws.amazon.com/pcs — Using Amazon EC2 Capacity Blocks for ML with AWS PCS](https://docs.aws.amazon.com/pcs/latest/userguide/capacity-blocks.html)
-- AWS PCS managed accounting: [docs.aws.amazon.com/pcs — Slurm accounting](https://docs.aws.amazon.com/pcs/latest/userguide/slurm-accounting.html)
-- AWS PCS IAM instance profiles: [docs.aws.amazon.com/pcs — IAM instance profiles](https://docs.aws.amazon.com/pcs/latest/userguide/security-instance-profiles.html)
-- Product requirements: [`PRD.md`](./PRD.md)
+- AWS PCS Capacity Blocks: https://docs.aws.amazon.com/pcs/latest/userguide/capacity-blocks.html
+- AWS PCS Slurm accounting: https://docs.aws.amazon.com/pcs/latest/userguide/slurm-accounting.html
+- AWS PCS IAM instance profiles: https://docs.aws.amazon.com/pcs/latest/userguide/security-instance-profiles.html
+- AWS Neuron documentation: https://awsdocs-neuron.readthedocs-hosted.com
 
-<!-- Content on AWS PCS behavior was summarized from AWS documentation and rephrased for compliance with licensing restrictions. -->
+<!-- AWS PCS and Neuron behavior described here is summarized from AWS documentation. -->
