@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# deploy-pcs.sh — Trainium Course Cluster, AWS PCS (Parallel Computing Service)
-# variant. Stands up a Slurm cluster whose compute fleet is a trn2 ML Capacity
-# Block, using AWS PCS instead of AWS ParallelCluster.
+# deploy-pcs.sh — Trainium Course Cluster on AWS PCS (Parallel Computing
+# Service). Stands up a Slurm cluster whose compute fleet is Trainium, either a
+# trn2 ML Capacity Block (--purchase-option CAPACITY_BLOCK, the default and the
+# proven path) or on-demand Trainium such as trn1 (--purchase-option ONDEMAND).
 #
 # This is the PCS sibling of scripts/deploy.sh (the ParallelCluster deploy) and
 # deliberately mirrors its style: `set -euo pipefail`, flag parsing, local +
@@ -35,9 +36,10 @@
 #      rendered with the EFS filesystem id + region injected.
 #   7. Create the PCS cluster: SLURM 25.11 (24.11 is EOL), size SMALL,
 #      networking = {subnet, SG}, managed accounting mode STANDARD.
-#   8. Create the PCS compute node group: purchaseOption CAPACITY_BLOCK,
-#      the custom launch template, the AWSPCS instance profile, subnet in the
-#      CB AZ, static scaling (min==max), instanceConfigs = the trn2 type.
+#   8. Create the PCS compute node group: purchaseOption = --purchase-option
+#      (CAPACITY_BLOCK or ONDEMAND), the custom launch template, the AWSPCS
+#      instance profile, subnet in the compute AZ, static scaling (min==max),
+#      instanceConfigs = the compute instance type.
 #   9. Create the PCS queue `nki` bound to the compute node group.
 #
 # ----------------------------------------------------------------------------
@@ -63,17 +65,24 @@ usage: $0 [options]
 
 Required:
   --cluster-name NAME              PCS cluster name. [A-Za-z][A-Za-z0-9-]{2,40}
-  --region REGION                  only sa-east-1 or us-east-2 are supported
-  --capacity-reservation-id CR_ID  the trn2 ML Capacity Block, format cr-XXXX
-  --availability-zone AZ           must match the Capacity Block's AZ
-  --subnet-id SUBNET_ID            private subnet in the CB AZ (subnet-XXXX)
+  --region REGION                  supported: sa-east-1, us-east-2, us-east-1, us-west-2
+  --subnet-id SUBNET_ID            private subnet (subnet-XXXX); its AZ is used
   --vpc-id VPC_ID                  VPC the subnet lives in (vpc-XXXX)
   --student-count N                1..500 (recorded for the follow-up login node)
   --alert-email EMAIL              budget alert destination (follow-up wiring)
 
+Purchase model:
+  --purchase-option OPT            CAPACITY_BLOCK (default) or ONDEMAND
+                                   CAPACITY_BLOCK: trn2 ML Capacity Block
+                                     (requires --capacity-reservation-id + --availability-zone)
+                                   ONDEMAND:       e.g. on-demand trn1 (no CB required;
+                                     AZ is derived from --subnet-id)
+  --capacity-reservation-id CR_ID  the trn2 ML Capacity Block, cr-XXXX (CAPACITY_BLOCK only)
+  --availability-zone AZ           must match the CB's AZ (CAPACITY_BLOCK only)
+
 Common:
-  --compute-instance-type TYPE     default trn2.3xlarge
-  --compute-node-count N           default 1 (must be <= Capacity Block size)
+  --compute-instance-type TYPE     default trn2.3xlarge (e.g. trn1.32xlarge for ONDEMAND)
+  --compute-node-count N           default 1 (CAPACITY_BLOCK: must be <= CB size)
   --efs-id FS_ID                   reuse an existing EFS filesystem (fs-XXXX) for
                                    /shared instead of creating/reusing one by tag
   --dry-run                        run all validation, then stop before mutating
@@ -85,6 +94,7 @@ EOF
 # Defaults
 COMPUTE_INSTANCE_TYPE=trn2.3xlarge
 COMPUTE_NODE_COUNT=1
+PURCHASE_OPTION=CAPACITY_BLOCK   # CAPACITY_BLOCK (trn2 MLCB) or ONDEMAND (e.g. trn1)
 EFS_ID=""            # empty => create (or reuse-by-tag) an EFS; else reuse this fs-id
 DRY_RUN=false
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -117,6 +127,7 @@ while (( $# )); do
     --alert-email)             ALERT_EMAIL="$2"; shift 2;;
     --compute-instance-type)   COMPUTE_INSTANCE_TYPE="$2"; shift 2;;
     --compute-node-count)      COMPUTE_NODE_COUNT="$2"; shift 2;;
+    --purchase-option)         PURCHASE_OPTION="$2"; shift 2;;
     --efs-id)                  EFS_ID="$2"; shift 2;;
     --dry-run)                 DRY_RUN=true; shift 1;;
     -h|--help)                 usage;;
@@ -127,13 +138,27 @@ done
 # ============================================================================
 # Local validation (before any AWS call)
 # ============================================================================
-required_vars=(CLUSTER_NAME REGION CR_ID AZ SUBNET_ID VPC_ID STUDENT_COUNT ALERT_EMAIL)
+# Purchase option gates which flags are required. CAPACITY_BLOCK (trn2 MLCB)
+# needs a Capacity Block id + its AZ; ONDEMAND (e.g. trn1) needs neither — the
+# compute AZ is derived from the subnet.
+case "${PURCHASE_OPTION}" in
+  CAPACITY_BLOCK|ONDEMAND) : ;;
+  *)
+    echo "--purchase-option must be CAPACITY_BLOCK or ONDEMAND (got '${PURCHASE_OPTION}')" >&2
+    usage
+    ;;
+esac
+
+required_vars=(CLUSTER_NAME REGION SUBNET_ID VPC_ID STUDENT_COUNT ALERT_EMAIL)
+if [[ "${PURCHASE_OPTION}" == "CAPACITY_BLOCK" ]]; then
+  required_vars+=(CR_ID AZ)
+fi
 missing=()
 for var in "${required_vars[@]}"; do
   [[ -z "${!var}" ]] && missing+=("$var")
 done
 if (( ${#missing[@]} )); then
-  echo "missing required flags: ${missing[*]}" >&2
+  echo "missing required flags for --purchase-option ${PURCHASE_OPTION}: ${missing[*]}" >&2
   usage
 fi
 
@@ -144,10 +169,12 @@ fi
   echo "cluster-name must match ^[A-Za-z][A-Za-z0-9-]{2,40}\$ (got '${CLUSTER_NAME}')" >&2
   exit 1
 }
-[[ "${CR_ID}" =~ ^cr-[0-9a-f]{8,17}$ ]] || {
-  echo "capacity-reservation-id must look like cr-XXXXXXXX (got '${CR_ID}')" >&2
-  exit 1
-}
+if [[ -n "${CR_ID}" ]]; then
+  [[ "${CR_ID}" =~ ^cr-[0-9a-f]{8,17}$ ]] || {
+    echo "capacity-reservation-id must look like cr-XXXXXXXX (got '${CR_ID}')" >&2
+    exit 1
+  }
+fi
 [[ "${SUBNET_ID}" =~ ^subnet-[0-9a-f]{8,17}$ ]] || {
   echo "subnet-id must look like subnet-XXXXXXXX (got '${SUBNET_ID}')" >&2
   exit 1
@@ -175,17 +202,17 @@ if [[ -n "${EFS_ID}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Region constraint. Same allow-list as the ParallelCluster kit
-# (scripts/deploy.sh): sa-east-1 (São Paulo, the trn2.3xlarge MLCB home) and
-# us-east-2 (Ohio, trn2.48xlarge). PCS itself is available in more regions, but
-# the course kit pins these two for parity with the parent kit and the proven
-# runs.
+# Region constraint. trn2.3xlarge MLCBs live in sa-east-1 (São Paulo) and
+# trn2.48xlarge in us-east-2 (Ohio) — the proven CAPACITY_BLOCK homes. On-demand
+# trn1 (trn1.2xlarge / trn1.32xlarge / trn1n.32xlarge) is offered in us-east-1
+# and us-west-2, so those are added for the ONDEMAND path. PCS is available in
+# more regions; this allow-list is a guardrail, not a hard PCS limit.
 # ---------------------------------------------------------------------------
 case "${REGION}" in
-  sa-east-1|us-east-2) : ;;
+  sa-east-1|us-east-2|us-east-1|us-west-2) : ;;
   *)
     echo "ERROR: --region ${REGION} is not supported by this kit." >&2
-    echo "  Only sa-east-1 and us-east-2 are supported (parity with the PCluster kit)." >&2
+    echo "  Supported: sa-east-1, us-east-2 (trn2 MLCB); us-east-1, us-west-2 (trn1 on-demand)." >&2
     exit 1
     ;;
 esac
@@ -208,17 +235,22 @@ PROFILE_NAME="${ROLE_NAME}"                    # instance profile shares the rol
 LT_NAME="AWSPCS-${CLUSTER_NAME}-lt"
 EFS_CREATION_TOKEN="${CLUSTER_NAME}-shared-efs" # stable token => idempotent create-file-system
 
-# Per-node NeuronCore count, derived from the compute shape (trn2.3xlarge=4,
-# trn2.48xlarge=16; default 4 as a sane fallback). Mirrors the parent
-# ParallelCluster kit's derivation in scripts/deploy.sh, but on PCS this value
-# feeds the node **Feature** `neuroncores<N>` at CNG creation (step 7), NOT a
-# Slurm `Gres=neuroncore:N` — `Gres`/`GresTypes` are in NEITHER the PCS cluster
-# nor CNG custom-settings allow-lists, so NeuronCore selection on PCS is
-# node-level (via --constraint) only. See ../docs/design.md Phase 2.
+# Per-node NeuronCore count, derived from the compute shape. trn2: 3xlarge=4,
+# 48xlarge=16. trn1: 2xlarge=2 (1 chip x 2 NeuronCores-v1), 32xlarge/trn1n=32
+# (16 chips). On PCS this value feeds the node **Feature** `neuroncores<N>` at
+# CNG creation (step 7), NOT a Slurm `Gres=neuroncore:N` — `Gres`/`GresTypes`
+# are in NEITHER the PCS cluster nor CNG custom-settings allow-lists, so
+# NeuronCore selection on PCS is node-level (via --constraint) only, and this
+# count is an informational feature label, not a schedulable resource. See
+# ../docs/design.md Phase 2.
 case "${COMPUTE_INSTANCE_TYPE}" in
-  trn2.48xlarge) PER_NODE_NEURONCORES=16 ;;
-  trn2.3xlarge)  PER_NODE_NEURONCORES=4  ;;
-  *)             PER_NODE_NEURONCORES=4  ;;
+  trn2.48xlarge)  PER_NODE_NEURONCORES=16 ;;
+  trn2.3xlarge)   PER_NODE_NEURONCORES=4  ;;
+  trn1.32xlarge)  PER_NODE_NEURONCORES=32 ;;
+  trn1n.32xlarge) PER_NODE_NEURONCORES=32 ;;
+  trn1.2xlarge)   PER_NODE_NEURONCORES=2  ;;
+  *)              PER_NODE_NEURONCORES=4
+                  echo "    WARNING: unknown NeuronCore count for ${COMPUTE_INSTANCE_TYPE}; defaulting Feature to neuroncores4 (informational only)." >&2 ;;
 esac
 
 # ============================================================================
@@ -235,57 +267,70 @@ echo "    account=${ACCOUNT_ID} region=${REGION}"
 # ec2:DescribeCapacityBlockStatus to manage a CAPACITY_BLOCK-backed node group.
 # See ../docs/design.md for the full IAM note.
 # ---------------------------------------------------------------------------
-echo "==> validating Capacity Block ${CR_ID}"
-cr_json=$(aws ec2 describe-capacity-reservations \
-  --region "${REGION}" \
-  --capacity-reservation-ids "${CR_ID}" \
-  --query 'CapacityReservations[0].{state:State,az:AvailabilityZone,type:InstanceType,count:TotalInstanceCount,rtype:ReservationType,end:EndDate}' \
-  --output json 2>/dev/null || echo '{}')
-cr_state=$(echo "${cr_json}" | jq -r '.state // "unknown"')
-cr_az=$(echo "${cr_json}" | jq -r '.az // "unknown"')
-cr_type=$(echo "${cr_json}" | jq -r '.type // "unknown"')
-cr_count=$(echo "${cr_json}" | jq -r '.count // "0"')
-cr_rtype=$(echo "${cr_json}" | jq -r '.rtype // "unknown"')
-cr_end=$(echo "${cr_json}" | jq -r '.end // empty')
-echo "    state=${cr_state} az=${cr_az} type=${cr_type} count=${cr_count} reservationType=${cr_rtype} end=${cr_end:-<none>}"
+cr_count=""; cr_az=""   # populated below for CAPACITY_BLOCK; left empty for ONDEMAND
+if [[ "${PURCHASE_OPTION}" == "CAPACITY_BLOCK" ]]; then
+  echo "==> validating Capacity Block ${CR_ID}"
+  cr_json=$(aws ec2 describe-capacity-reservations \
+    --region "${REGION}" \
+    --capacity-reservation-ids "${CR_ID}" \
+    --query 'CapacityReservations[0].{state:State,az:AvailabilityZone,type:InstanceType,count:TotalInstanceCount,rtype:ReservationType,end:EndDate}' \
+    --output json 2>/dev/null || echo '{}')
+  cr_state=$(echo "${cr_json}" | jq -r '.state // "unknown"')
+  cr_az=$(echo "${cr_json}" | jq -r '.az // "unknown"')
+  cr_type=$(echo "${cr_json}" | jq -r '.type // "unknown"')
+  cr_count=$(echo "${cr_json}" | jq -r '.count // "0"')
+  cr_rtype=$(echo "${cr_json}" | jq -r '.rtype // "unknown"')
+  cr_end=$(echo "${cr_json}" | jq -r '.end // empty')
+  echo "    state=${cr_state} az=${cr_az} type=${cr_type} count=${cr_count} reservationType=${cr_rtype} end=${cr_end:-<none>}"
 
-if [[ "${cr_state}" == "unknown" ]]; then
-  echo "    ERROR: could not describe Capacity Block ${CR_ID} in ${REGION}." >&2
-  echo "      Check the id/region and that the caller has ec2:DescribeCapacityReservations." >&2
-  exit 1
-fi
-if [[ "${cr_state}" != "active" && "${cr_state}" != "scheduled" && "${cr_state}" != "payment-pending" ]]; then
-  echo "    ERROR: Capacity Block is in state ${cr_state}; expected active/scheduled/payment-pending." >&2
-  exit 1
-fi
-if [[ "${cr_az}" != "${AZ}" ]]; then
-  echo "    ERROR: --availability-zone ${AZ} does not match the CB AZ ${cr_az}." >&2
-  echo "      The PCS compute node group subnet MUST be in the CB's AZ." >&2
-  exit 1
-fi
-if [[ "${cr_type}" != "${COMPUTE_INSTANCE_TYPE}" ]]; then
-  echo "    ERROR: --compute-instance-type ${COMPUTE_INSTANCE_TYPE} does not match CB type ${cr_type}." >&2
-  exit 1
-fi
-if [[ "${cr_rtype}" != "capacity-block" ]]; then
-  echo "    WARNING: reservation type is '${cr_rtype}', expected 'capacity-block'." >&2
-  echo "      Proceeding, but purchaseOption=CAPACITY_BLOCK expects a Capacity Block reservation." >&2
-fi
-if (( COMPUTE_NODE_COUNT > cr_count )); then
-  echo "    ERROR: --compute-node-count ${COMPUTE_NODE_COUNT} exceeds CB size ${cr_count}." >&2
-  exit 1
+  if [[ "${cr_state}" == "unknown" ]]; then
+    echo "    ERROR: could not describe Capacity Block ${CR_ID} in ${REGION}." >&2
+    echo "      Check the id/region and that the caller has ec2:DescribeCapacityReservations." >&2
+    exit 1
+  fi
+  if [[ "${cr_state}" != "active" && "${cr_state}" != "scheduled" && "${cr_state}" != "payment-pending" ]]; then
+    echo "    ERROR: Capacity Block is in state ${cr_state}; expected active/scheduled/payment-pending." >&2
+    exit 1
+  fi
+  if [[ "${cr_az}" != "${AZ}" ]]; then
+    echo "    ERROR: --availability-zone ${AZ} does not match the CB AZ ${cr_az}." >&2
+    echo "      The PCS compute node group subnet MUST be in the CB's AZ." >&2
+    exit 1
+  fi
+  if [[ "${cr_type}" != "${COMPUTE_INSTANCE_TYPE}" ]]; then
+    echo "    ERROR: --compute-instance-type ${COMPUTE_INSTANCE_TYPE} does not match CB type ${cr_type}." >&2
+    exit 1
+  fi
+  if [[ "${cr_rtype}" != "capacity-block" ]]; then
+    echo "    WARNING: reservation type is '${cr_rtype}', expected 'capacity-block'." >&2
+    echo "      Proceeding, but purchaseOption=CAPACITY_BLOCK expects a Capacity Block reservation." >&2
+  fi
+  if (( COMPUTE_NODE_COUNT > cr_count )); then
+    echo "    ERROR: --compute-node-count ${COMPUTE_NODE_COUNT} exceeds CB size ${cr_count}." >&2
+    exit 1
+  fi
+else
+  echo "==> ONDEMAND purchase option: skipping Capacity Block validation"
+  echo "    compute AZ will be derived from --subnet-id ${SUBNET_ID}"
 fi
 
 # Confirm the subnet is really in the CB AZ (cheap guard against a mismatched
 # --subnet-id that would otherwise fail deep inside node-group creation).
-echo "==> validating subnet ${SUBNET_ID} is in ${AZ}"
+echo "==> validating subnet ${SUBNET_ID}"
 subnet_az=$(aws ec2 describe-subnets --region "${REGION}" --subnet-ids "${SUBNET_ID}" \
   --query 'Subnets[0].AvailabilityZone' --output text 2>/dev/null || echo "unknown")
 subnet_vpc=$(aws ec2 describe-subnets --region "${REGION}" --subnet-ids "${SUBNET_ID}" \
   --query 'Subnets[0].VpcId' --output text 2>/dev/null || echo "unknown")
 echo "    subnet az=${subnet_az} vpc=${subnet_vpc}"
+# ONDEMAND: no CB to pin to, so the compute AZ is whatever the subnet is in.
+if [[ -z "${AZ}" ]]; then
+  AZ="${subnet_az}"
+  echo "    derived --availability-zone ${AZ} from the subnet"
+fi
 if [[ "${subnet_az}" != "${AZ}" ]]; then
-  echo "    ERROR: subnet ${SUBNET_ID} is in ${subnet_az}, not the CB AZ ${AZ}." >&2
+  echo "    ERROR: subnet ${SUBNET_ID} is in ${subnet_az}, not the expected AZ ${AZ}." >&2
+  [[ "${PURCHASE_OPTION}" == "CAPACITY_BLOCK" ]] && \
+    echo "      The PCS compute node group subnet MUST be in the CB's AZ." >&2
   exit 1
 fi
 if [[ "${subnet_vpc}" != "${VPC_ID}" ]]; then
@@ -523,29 +568,73 @@ echo "    EFS ready: ${EFS_ID} (/shared is mounted by the compute-node UserData)
 # macOS (no -w flag) and Linux (which would otherwise wrap at 76 cols).
 echo "==> rendering + encoding user-data from ${USERDATA_FILE} (EFS_FS_ID=${EFS_ID}, region=${REGION})"
 rendered_userdata=$(mktemp "${TMPDIR:-/tmp}/pcs-neuron-userdata.XXXXXX.sh")
+# PCS caps launch-template user data at 13384 bytes (stricter than EC2's 16 KB).
+# The commented source base64s to ~18 KB, so after injecting EFS_FS_ID/EFS_REGION
+# we MINIFY: keep the shebang (NR==1), drop comment-only lines and blank lines
+# (the two heredoc bodies in this script contain neither, so this is safe). That
+# brings the encoded payload to ~8 KB. If neuron-userdata.sh grows past the limit
+# even minified, switch to S3-staging + a fetch-and-run bootstrap (as the login
+# node does).
 sed -e "s|^EFS_FS_ID=.*|EFS_FS_ID=\"${EFS_ID}\"|" \
     -e "s|^EFS_REGION=.*|EFS_REGION=\"${REGION}\"|" \
-    "${USERDATA_FILE}" > "${rendered_userdata}"
-USER_DATA_B64=$(base64 < "${rendered_userdata}" | tr -d '\n')
-rm -f "${rendered_userdata}"
+    "${USERDATA_FILE}" \
+  | awk 'NR==1 || ($0 !~ /^[ \t]*#/ && $0 !~ /^[ \t]*$/)' > "${rendered_userdata}"
+# PCS requires launch-template user data in MIME multipart form (cloud-init),
+# not a bare "#!" script ("Specify the userdata ... in MIME multipart format").
+# Wrap the minified script as a single text/x-shellscript part, then base64.
+mime_userdata=$(mktemp "${TMPDIR:-/tmp}/pcs-neuron-userdata.XXXXXX.mime")
+{
+  printf 'Content-Type: multipart/mixed; boundary="==PCS=="\n'
+  printf 'MIME-Version: 1.0\n\n'
+  printf -- '--==PCS==\n'
+  printf 'Content-Type: text/x-shellscript; charset="us-ascii"\n'
+  printf 'MIME-Version: 1.0\n\n'
+  cat "${rendered_userdata}"
+  printf '\n--==PCS==--\n'
+} > "${mime_userdata}"
+USER_DATA_B64=$(base64 < "${mime_userdata}" | tr -d '\n')
+ud_bytes=${#USER_DATA_B64}
+echo "    user-data (MIME multipart) encoded to ${ud_bytes} bytes (PCS limit 13384)"
+if (( ud_bytes > 13384 )); then
+  echo "    ERROR: encoded user-data ${ud_bytes} B exceeds the PCS 13384 B limit even after minify." >&2
+  echo "      Trim bootstrap/neuron-userdata.sh or switch to S3-staged user-data." >&2
+  rm -f "${rendered_userdata}" "${mime_userdata}"; exit 1
+fi
+rm -f "${rendered_userdata}" "${mime_userdata}"
 
 # Build launch-template-data as JSON via jq so values are injected safely.
-LT_DATA=$(jq -n \
-  --arg ami "${PCS_AMI}" \
-  --arg itype "${COMPUTE_INSTANCE_TYPE}" \
-  --arg crid "${CR_ID}" \
-  --arg sg "${SG_ID}" \
-  --arg ud "${USER_DATA_B64}" \
-  '{
-     ImageId: $ami,
-     InstanceType: $itype,
-     InstanceMarketOptions: { MarketType: "capacity-block" },
-     CapacityReservationSpecification: {
-       CapacityReservationTarget: { CapacityReservationId: $crid }
-     },
-     SecurityGroupIds: [ $sg ],
-     UserData: $ud
-   }')
+# CAPACITY_BLOCK adds the capacity-block market option + CR target; ONDEMAND
+# omits both so the fleet launches as ordinary on-demand instances.
+if [[ "${PURCHASE_OPTION}" == "CAPACITY_BLOCK" ]]; then
+  LT_DATA=$(jq -n \
+    --arg ami "${PCS_AMI}" \
+    --arg itype "${COMPUTE_INSTANCE_TYPE}" \
+    --arg crid "${CR_ID}" \
+    --arg sg "${SG_ID}" \
+    --arg ud "${USER_DATA_B64}" \
+    '{
+       ImageId: $ami,
+       InstanceType: $itype,
+       InstanceMarketOptions: { MarketType: "capacity-block" },
+       CapacityReservationSpecification: {
+         CapacityReservationTarget: { CapacityReservationId: $crid }
+       },
+       SecurityGroupIds: [ $sg ],
+       UserData: $ud
+     }')
+else
+  LT_DATA=$(jq -n \
+    --arg ami "${PCS_AMI}" \
+    --arg itype "${COMPUTE_INSTANCE_TYPE}" \
+    --arg sg "${SG_ID}" \
+    --arg ud "${USER_DATA_B64}" \
+    '{
+       ImageId: $ami,
+       InstanceType: $itype,
+       SecurityGroupIds: [ $sg ],
+       UserData: $ud
+     }')
+fi
 
 echo "==> ensuring launch template ${LT_NAME}"
 LT_ID=$(aws ec2 describe-launch-templates --region "${REGION}" \
@@ -583,31 +672,41 @@ existing_cluster_status=$(aws pcs get-cluster --region "${REGION}" \
   --query 'cluster.status' --output text 2>/dev/null || echo "MISSING")
 
 if [[ "${existing_cluster_status}" == "MISSING" ]]; then
-  # Slurm config on the cluster: managed accounting (mode=STANDARD) PLUS
+  # Preferred Slurm config: managed accounting (mode=STANDARD) PLUS
   # AccountingStorageEnforce=associations,limits,qos so the login-node QoS
-  # (MaxWall + MaxJobsPerUser, set via sacctmgr in Phases 1/3) is actually
-  # ENFORCED. AccountingStorageEnforce IS in the PCS cluster custom-settings
-  # allow-list (slurm-custom-settings-cluster). The whole --slurm-configuration
-  # value is SINGLE-quoted because the enforce value contains commas and inner
-  # double-quotes; single quotes make the shell pass exactly one literal arg
-  # (no variable expansion is needed here). Member casing note: `accounting` is
-  # lowercase (already proven working in this script) while `SlurmCustomSettings`
-  # follows the AWS docs' casing — re-verify this mixed shorthand parses on the
-  # first live run.
+  # (MaxWall + MaxJobsPerUser, set via sacctmgr in Phases 1/3) is ENFORCED.
+  # Both `accounting` and `slurmCustomSettings` are lowercase model members.
+  #
+  # CLI-VERSION FALLBACK: PCS managed accounting is only in the newer AWS CLI
+  # PCS model; older CLIs reject `accounting` under --slurm-configuration
+  # ("Unknown parameter in slurmConfiguration: accounting"). We try WITH
+  # accounting first and, on that specific rejection, fall back to a plain
+  # cluster (no per-student QoS enforcement — a documented Phase-3 follow-up,
+  # not required to run jobs). Upgrade the AWS CLI to get managed accounting.
   #
   # DELIBERATELY OMITTED: AccountingStorageTRES=gres/neuroncore. That would need
   # a `neuroncore` Slurm GRES, and Gres/GresTypes are in NEITHER the cluster nor
   # the CNG PCS allow-lists — so only the base TRES plus wall-time/job-count QoS
   # limits are enforceable on PCS (no per-core tracking). See ../docs/design.md
   # Phase 2.
-  aws pcs create-cluster --region "${REGION}" \
-    --cluster-name "${CLUSTER_NAME}" \
-    --scheduler "type=SLURM,version=${SLURM_VERSION}" \
-    --size SMALL \
-    --networking "subnetIds=${SUBNET_ID},securityGroupIds=${SG_ID}" \
-    --slurm-configuration 'accounting={mode=STANDARD},SlurmCustomSettings=[{parameterName=AccountingStorageEnforce,parameterValue="associations,limits,qos"}]' \
-    --tags "Class=${CLUSTER_NAME}" "Purpose=trn-course-pcs" >/dev/null
-  echo "    create-cluster submitted"
+  cc_common=(--region "${REGION}"
+    --cluster-name "${CLUSTER_NAME}"
+    --scheduler "type=SLURM,version=${SLURM_VERSION}"
+    --size SMALL
+    --networking "subnetIds=${SUBNET_ID},securityGroupIds=${SG_ID}"
+    --tags "Class=${CLUSTER_NAME},Purpose=trn-course-pcs")
+  if err=$(aws pcs create-cluster "${cc_common[@]}" \
+        --slurm-configuration 'accounting={mode=STANDARD},slurmCustomSettings=[{parameterName=AccountingStorageEnforce,parameterValue="associations,limits,qos"}]' 2>&1); then
+    echo "    create-cluster submitted (managed accounting STANDARD + enforce)"
+  elif grep -qiE 'slurmConfiguration|accounting' <<<"${err}"; then
+    echo "    WARN: this AWS CLI lacks PCS managed accounting; creating cluster WITHOUT it." >&2
+    echo "          Per-student QoS enforcement (Phase 3) is unavailable until the CLI is upgraded." >&2
+    aws pcs create-cluster "${cc_common[@]}" >/dev/null
+    echo "    create-cluster submitted (no managed accounting)"
+  else
+    echo "${err}" >&2
+    exit 1
+  fi
 else
   echo "    cluster already exists (status=${existing_cluster_status}); skipping create"
 fi
@@ -631,11 +730,13 @@ while :; do
 done
 
 # ============================================================================
-# 7. PCS compute node group (CAPACITY_BLOCK)
+# 7. PCS compute node group (${PURCHASE_OPTION})
 # ============================================================================
-# purchaseOption CAPACITY_BLOCK + the custom launch template (which carries the
-# capacity-block market option and CR target) + the AWSPCS instance profile.
-# Static scaling for a Capacity Block: minInstanceCount == maxInstanceCount.
+# purchaseOption = ${PURCHASE_OPTION} + the custom launch template (which for
+# CAPACITY_BLOCK carries the capacity-block market option and CR target, and for
+# ONDEMAND is a plain on-demand LT) + the AWSPCS instance profile. Scaling is
+# static (minInstanceCount == maxInstanceCount): required for a Capacity Block,
+# and kept for ONDEMAND too so a course has a predictable, always-on fleet.
 echo "==> ensuring compute node group ${CNG_NAME}"
 existing_cng_status=$(aws pcs get-compute-node-group --region "${REGION}" \
   --cluster-identifier "${CLUSTER_ID}" \
@@ -667,13 +768,13 @@ if [[ "${existing_cng_status}" == "MISSING" ]]; then
           --compute-node-group-name "${CNG_NAME}" \
           --ami-id "${PCS_AMI}" \
           --subnet-ids "${SUBNET_ID}" \
-          --purchase-option CAPACITY_BLOCK \
+          --purchase-option "${PURCHASE_OPTION}" \
           --custom-launch-template "id=${LT_ID},version=${LT_VERSION}" \
           --iam-instance-profile-arn "${PROFILE_ARN}" \
           --scaling-configuration "minInstanceCount=${COMPUTE_NODE_COUNT},maxInstanceCount=${COMPUTE_NODE_COUNT}" \
           --instance-configs "instanceType=${COMPUTE_INSTANCE_TYPE}" \
-          --slurm-configuration 'SlurmCustomSettings=[{parameterName=Features,parameterValue="neuron,neuroncores'"${PER_NODE_NEURONCORES}"'"}]' \
-          --tags "Class=${CLUSTER_NAME}" "Purpose=trn-course-pcs" 2>&1); then
+          --slurm-configuration 'slurmCustomSettings=[{parameterName=Features,parameterValue="neuron,neuroncores'"${PER_NODE_NEURONCORES}"'"}]' \
+          --tags "Class=${CLUSTER_NAME},Purpose=trn-course-pcs" 2>&1); then
       echo "    create-compute-node-group submitted"
       break
     fi
@@ -726,7 +827,7 @@ if [[ "${existing_queue_status}" == "MISSING" ]]; then
     --cluster-identifier "${CLUSTER_ID}" \
     --queue-name "${QUEUE_NAME}" \
     --compute-node-group-configurations "computeNodeGroupId=${CNG_ID}" \
-    --tags "Class=${CLUSTER_NAME}" "Purpose=trn-course-pcs" >/dev/null
+    --tags "Class=${CLUSTER_NAME},Purpose=trn-course-pcs" >/dev/null
   echo "    create-queue submitted"
 else
   echo "    queue already exists (status=${existing_queue_status}); skipping create"
@@ -754,17 +855,29 @@ done
 echo ""
 echo "============================================================"
 echo "AWS PCS deploy complete (proven core)."
+acct_mode=$(aws pcs get-cluster --region "${REGION}" --cluster-identifier "${CLUSTER_ID}" \
+  --query 'cluster.slurmConfiguration.accounting.mode' --output text 2>/dev/null || echo "NONE")
+[[ -z "${acct_mode}" || "${acct_mode}" == "None" ]] && acct_mode="NONE"
 echo "  Cluster:        ${CLUSTER_NAME} (id ${CLUSTER_ID})"
 echo "  Region / AZ:    ${REGION} / ${AZ}"
-echo "  Scheduler:      SLURM ${SLURM_VERSION}, size SMALL, managed accounting STANDARD"
-echo "  Accounting:     AccountingStorageEnforce=associations,limits,qos (login-node QoS enforced)"
-echo "  Node group:     ${CNG_NAME} (id ${CNG_ID}) purchaseOption=CAPACITY_BLOCK"
+echo "  Scheduler:      SLURM ${SLURM_VERSION}, size SMALL"
+if [[ "${acct_mode}" == "STANDARD" ]]; then
+  echo "  Accounting:     managed STANDARD + AccountingStorageEnforce=associations,limits,qos (login-node QoS enforceable)"
+else
+  echo "  Accounting:     none (this AWS CLI lacks PCS managed accounting; per-student QoS unavailable until the CLI is upgraded)"
+fi
+echo "  Node group:     ${CNG_NAME} (id ${CNG_ID}) purchaseOption=${PURCHASE_OPTION}"
 echo "  NeuronCore:     node Feature 'neuron,neuroncores${PER_NODE_NEURONCORES}' -> select with --constraint=neuron"
 echo "  Queue:          ${QUEUE_NAME} (Slurm partition)"
 echo "  Compute:        ${COMPUTE_NODE_COUNT} x ${COMPUTE_INSTANCE_TYPE}"
-echo "  Capacity Block: ${CR_ID} (${cr_count} instances in ${cr_az})"
+if [[ "${PURCHASE_OPTION}" == "CAPACITY_BLOCK" ]]; then
+  echo "  Capacity Block: ${CR_ID} (${cr_count} instances in ${cr_az})"
+  echo "  Launch tmpl:    ${LT_ID} v${LT_VERSION} (capacity-block market + CR target + Neuron user-data)"
+else
+  echo "  Capacity Block: n/a (ONDEMAND)"
+  echo "  Launch tmpl:    ${LT_ID} v${LT_VERSION} (on-demand + Neuron user-data)"
+fi
 echo "  PCS AMI:        ${PCS_AMI}"
-echo "  Launch tmpl:    ${LT_ID} v${LT_VERSION} (capacity-block market + CR target + Neuron user-data)"
 echo "  EFS /shared:    ${EFS_ID} (mount target in ${SUBNET_ID}, cluster SG ${SG_ID})"
 echo "  Security group: ${SG_ID} (self-referencing; all egress)"
 echo "  IAM role:       ${ROLE_NAME} (instance profile ${PROFILE_ARN})"
@@ -779,8 +892,13 @@ echo "      students select a Trainium node with --constraint=neuron. This is"
 echo "      NODE-LEVEL selection ONLY — per-core NeuronCore isolation is NOT"
 echo "      available on PCS (Gres is not in the PCS allow-list), so it replaces"
 echo "      the parent kit's per-node Gres=neuroncore:N."
-echo "    * cluster AccountingStorageEnforce=associations,limits,qos, so the"
-echo "      login-node per-student QoS (MaxWall + MaxJobsPerUser) IS enforced."
+if [[ "${acct_mode}" == "STANDARD" ]]; then
+  echo "    * cluster AccountingStorageEnforce=associations,limits,qos, so the"
+  echo "      login-node per-student QoS (MaxWall + MaxJobsPerUser) IS enforceable."
+else
+  echo "    * NO managed accounting on this cluster (CLI too old), so per-student"
+  echo "      QoS (MaxWall + MaxJobsPerUser) is NOT enforceable; upgrade the AWS CLI."
+fi
 echo "  Sibling phases (see ../docs/design.md): the login node that SETS that QoS"
 echo "  via sacctmgr (Phases 1/3) and EFS /shared (Phase 4, created above)."
 echo "  STILL not wired in this script:"

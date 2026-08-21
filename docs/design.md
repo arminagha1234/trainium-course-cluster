@@ -313,10 +313,27 @@ The worked example this run validated lives at
 runnable "hello, Trainium" kernel to hand students as a "run this first to see
 the flow" before the graded `scale_by_two` stub under `../harness/`.
 
+## Purchase options: trn2 Capacity Block or on-demand trn1
+
+`deploy-pcs.sh` (and `infra/pcs.yaml`) take `--purchase-option`
+(`CAPACITY_BLOCK`, default, or `ONDEMAND`). `CAPACITY_BLOCK` is the live-proven
+trn2 path: the launch template carries the capacity-block market option + CR
+target, the CNG uses `purchaseOption=CAPACITY_BLOCK`, and the compute AZ is
+pinned to (and validated against) the Capacity Block's AZ. `ONDEMAND` targets
+on-demand Trainium such as trn1 (`trn1.2xlarge`, `trn1.32xlarge`,
+`trn1n.32xlarge`): no CR is required, the launch template omits the market
+option + CR target, the CNG uses `purchaseOption=ONDEMAND`, and the compute AZ is
+derived from the subnet. The region allow-list is broadened to `us-east-1` and
+`us-west-2` (trn1 on-demand homes) alongside `sa-east-1` / `us-east-2` (trn2 MLCB
+homes). The `ONDEMAND` branch is code-complete but not yet live-validated; the
+Phase-2 `neuroncores<N>` node Feature is informational on PCS either way (no
+per-core scheduling), so a trn1 core-count label does not affect scheduling.
+
 ## Notes carried over from the proven run
 
-- The compute node group subnet's **AZ must match the Capacity Block's AZ**;
-  `deploy-pcs.sh` validates this before creating anything.
+- For `CAPACITY_BLOCK`, the compute node group subnet's **AZ must match the
+  Capacity Block's AZ**; `deploy-pcs.sh` validates this before creating anything.
+  For `ONDEMAND` the AZ is simply taken from the subnet.
 - The instance-profile role **name must start with `AWSPCS`** (or carry the
   `/aws-pcs/` path) or PCS rejects it with "The role ARN is invalid".
 - PCS needs `ec2:DescribeCapacityReservations`, `ec2:DescribeCapacityBlocks`,

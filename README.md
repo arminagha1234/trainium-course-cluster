@@ -73,16 +73,31 @@ support matrix:
   [`docs/design.md`](./docs/design.md) "PHASE STATUS" (Phase 2).
 - Treat this as **"works but officially unsupported."** Validate again on your
   own account/region before relying on it for a live class.
+- **The on-demand / trn1 path (`--purchase-option ONDEMAND`) is code-complete
+  but not yet live-validated.** The proven run above was trn2-on-a-Capacity-Block;
+  the ONDEMAND branch (plain launch template, no CR target, AZ derived from the
+  subnet) and the trn1 NeuronCore-count labels (`trn1.2xlarge=2`,
+  `trn1.32xlarge=32`) have not been exercised end-to-end. The `neuroncores<N>`
+  value is only an informational node Feature on PCS (no per-core scheduling
+  either way), so a wrong count would not break scheduling. Validate on your own
+  account before a live class.
 
 ## How to deploy
 
-Prereqs: AWS CLI v2 (with the `pcs` commands), `jq`, `base64`, an active trn2
-ML Capacity Block, and a private subnet in the CB's AZ. The deploying identity
-needs the usual `ec2`/`iam`/`ssm`/`pcs` create permissions plus
-`ec2:DescribeCapacityReservations` (PCS itself additionally needs
-`ec2:DescribeCapacityBlocks` and `ec2:DescribeCapacityBlockStatus` — see
-`docs/design.md`).
+The compute fleet can be either a **trn2 ML Capacity Block**
+(`--purchase-option CAPACITY_BLOCK`, the default and the live-proven path) or
+**on-demand Trainium such as trn1** (`--purchase-option ONDEMAND`, no Capacity
+Block required). Pick the path that matches your capacity.
 
+Prereqs: AWS CLI v2 (with the `pcs` commands), `jq`, `base64`, and a private
+subnet in the compute AZ. The deploying identity needs the usual
+`ec2`/`iam`/`ssm`/`pcs` create permissions; for the CAPACITY_BLOCK path it also
+needs `ec2:DescribeCapacityReservations` (and PCS itself needs
+`ec2:DescribeCapacityBlocks` + `ec2:DescribeCapacityBlockStatus` — see
+`docs/design.md`). Supported regions: `sa-east-1`, `us-east-2` (trn2 MLCB homes)
+and `us-east-1`, `us-west-2` (trn1 on-demand).
+
+**Option A — trn2 ML Capacity Block (default):**
 ```bash
 # 1. Find the Capacity Block id + AZ:
 aws ec2 describe-capacity-reservations \
@@ -94,6 +109,7 @@ aws ec2 describe-capacity-reservations \
 ./scripts/deploy-pcs.sh \
   --cluster-name fall26-nki-pcs \
   --region us-east-2 \
+  --purchase-option CAPACITY_BLOCK \
   --capacity-reservation-id cr-0e168cd22e5919f69 \
   --availability-zone us-east-2b \
   --subnet-id subnet-xxxxxxxx \
@@ -102,10 +118,25 @@ aws ec2 describe-capacity-reservations \
   --compute-node-count 1 \
   --student-count 20 \
   --alert-email you@your.org
-
-# Tip: add --dry-run to run all validation (region + Capacity Block + subnet AZ)
-# and stop before creating any resources.
 ```
+
+**Option B — on-demand trn1 (no Capacity Block):**
+```bash
+./scripts/deploy-pcs.sh \
+  --cluster-name fall26-nki-trn1 \
+  --region us-west-2 \
+  --purchase-option ONDEMAND \
+  --subnet-id subnet-xxxxxxxx \
+  --vpc-id vpc-xxxxxxxx \
+  --compute-instance-type trn1.32xlarge \
+  --compute-node-count 1 \
+  --student-count 20 \
+  --alert-email you@your.org
+```
+
+With `ONDEMAND`, `--capacity-reservation-id` and `--availability-zone` are not
+needed: the compute AZ is derived from `--subnet-id`. Add `--dry-run` to run all
+validation and stop before creating any resources.
 
 What the script creates, in order:
 

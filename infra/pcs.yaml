@@ -3,10 +3,11 @@ Description: >
   Trainium Course Cluster - AWS PCS (Parallel Computing Service) variant.
   Best-effort CloudFormation mirror of pcs/scripts/deploy-pcs.sh: a self-
   referencing security group, an AWSPCS-named IAM role + instance profile, an
-  EFS /shared filesystem + mount target, an EC2 launch template (capacity-block
-  market option + Capacity Block target + Neuron user-data that also mounts
-  /shared), and the AWS::PCS::Cluster / ComputeNodeGroup / Queue that together
-  run a Slurm cluster on a trn2 ML Capacity Block.
+  EFS /shared filesystem + mount target, an EC2 launch template (Neuron
+  user-data that also mounts /shared, plus a capacity-block market option + CR
+  target when PurchaseOption=CAPACITY_BLOCK), and the AWS::PCS::Cluster /
+  ComputeNodeGroup / Queue that together run a Slurm cluster on Trainium: a trn2
+  ML Capacity Block (CAPACITY_BLOCK) or on-demand trn1 (ONDEMAND).
 
   ---------------------------------------------------------------------------
   THIS TEMPLATE MIRRORS pcs/scripts/deploy-pcs.sh (the proven CLI path). The
@@ -36,10 +37,22 @@ Parameters:
     AllowedPattern: '^[A-Za-z][A-Za-z0-9-]{2,40}$'
     Description: PCS cluster name (starts with a letter; letters/digits/hyphens).
 
+  PurchaseOption:
+    Type: String
+    Default: CAPACITY_BLOCK
+    AllowedValues: [CAPACITY_BLOCK, ONDEMAND]
+    Description: >
+      CAPACITY_BLOCK (trn2 ML Capacity Block; requires CapacityReservationId and
+      a subnet in the CB's AZ) or ONDEMAND (e.g. on-demand trn1; no CB, any
+      subnet in a supported region).
+
   CapacityReservationId:
     Type: String
-    AllowedPattern: '^cr-[0-9a-f]{8,17}$'
-    Description: The trn2 ML Capacity Block reservation id (cr-XXXXXXXX).
+    Default: ''
+    AllowedPattern: '^(cr-[0-9a-f]{8,17})?$'
+    Description: >
+      The trn2 ML Capacity Block reservation id (cr-XXXXXXXX). Required when
+      PurchaseOption=CAPACITY_BLOCK; leave empty for ONDEMAND.
 
   VpcId:
     Type: AWS::EC2::VPC::Id
@@ -72,12 +85,12 @@ Parameters:
     # Feature `neuroncores<N>` below, which avoids needing a Mapping and keeps
     # parity with the CLI's derived value. AllowedValues pins the two supported
     # shapes; widen or remove it if you deploy another Trainium type.
-    AllowedValues: [4, 16]
+    AllowedValues: [2, 4, 16, 32]
     Description: >
       Per-node NeuronCore count used to build the node Feature
-      `neuroncores<N>` (4 for trn2.3xlarge, 16 for trn2.48xlarge). Drives
-      node-level selection via `--constraint=neuron` only; NeuronCore is not a
-      Slurm GRES on PCS.
+      `neuroncores<N>` (trn2.3xlarge=4, trn2.48xlarge=16, trn1.2xlarge=2,
+      trn1.32xlarge/trn1n.32xlarge=32). Drives node-level selection via
+      `--constraint=neuron` only; NeuronCore is not a Slurm GRES on PCS.
 
   PcsAmiId:
     # Resolves the PCS sample AMI id from the SSM public parameter at deploy
@@ -85,6 +98,11 @@ Parameters:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
     Default: /aws/service/pcs/ami/dlami-base-ubuntu2404/x86_64/latest/ami-id
     Description: PCS base AMI (Ubuntu 24.04, x86_64), resolved from SSM.
+
+Conditions:
+  # CAPACITY_BLOCK adds the launch template's capacity-block market option + CR
+  # target; ONDEMAND omits both so the fleet launches as ordinary on-demand.
+  IsCapacityBlock: !Equals [!Ref PurchaseOption, CAPACITY_BLOCK]
 
 Resources:
   # ==========================================================================
@@ -221,11 +239,17 @@ Resources:
       LaunchTemplateData:
         ImageId: !Ref PcsAmiId
         InstanceType: !Ref ComputeInstanceType
-        InstanceMarketOptions:
-          MarketType: capacity-block
-        CapacityReservationSpecification:
-          CapacityReservationTarget:
-            CapacityReservationId: !Ref CapacityReservationId
+        # CAPACITY_BLOCK only: the capacity-block market option + CR target.
+        # ONDEMAND omits both (AWS::NoValue) for a plain on-demand launch.
+        InstanceMarketOptions: !If
+          - IsCapacityBlock
+          - MarketType: capacity-block
+          - !Ref AWS::NoValue
+        CapacityReservationSpecification: !If
+          - IsCapacityBlock
+          - CapacityReservationTarget:
+              CapacityReservationId: !Ref CapacityReservationId
+          - !Ref AWS::NoValue
         SecurityGroupIds:
           - !GetAtt ClusterSecurityGroup.GroupId
         TagSpecifications:
@@ -375,7 +399,7 @@ Resources:
       AmiId: !Ref PcsAmiId
       SubnetIds:
         - !Ref SubnetId
-      PurchaseOption: CAPACITY_BLOCK
+      PurchaseOption: !Ref PurchaseOption
       CustomLaunchTemplate:
         TemplateId: !Ref ComputeLaunchTemplate
         # Version must be a String. LatestVersionNumber is a Number, so stringify

@@ -205,14 +205,15 @@ for _c in "${ssh_cidr_ranges[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
-# Region constraint — same allow-list as deploy-pcs.sh / the parent kit:
-# sa-east-1 (Sao Paulo, trn2.3xlarge MLCB home) and us-east-2 (Ohio).
+# Region constraint — same allow-list as deploy-pcs.sh: sa-east-1 and us-east-2
+# (trn2 MLCB homes) plus us-east-1 and us-west-2 (trn1 on-demand). The login
+# node must run in the same region as its cluster.
 # ---------------------------------------------------------------------------
 case "${REGION}" in
-  sa-east-1|us-east-2) : ;;
+  sa-east-1|us-east-2|us-east-1|us-west-2) : ;;
   *)
     echo "ERROR: --region ${REGION} is not supported by this kit." >&2
-    echo "  Only sa-east-1 and us-east-2 are supported (parity with deploy-pcs.sh)." >&2
+    echo "  Supported: sa-east-1, us-east-2, us-east-1, us-west-2 (parity with deploy-pcs.sh)." >&2
     exit 1
     ;;
 esac
