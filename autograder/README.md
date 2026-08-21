@@ -27,7 +27,7 @@ Per submission, `run_autograder`:
    the student's uploaded `student.py` into it,
 3. `sbatch --constraint=neuron`s [`grade_job.sbatch`](./grade_job.sbatch) onto
    the shared trn2 fleet, which runs the kit harness
-   ([`../../harness/test_kernel.py`](../../harness/test_kernel.py)),
+   ([`../harness/test_kernel.py`](../harness/test_kernel.py)),
 4. polls `squeue` until the job finishes (or `JOB_TIMEOUT` elapses), then scps
    the harness's `result.json` back into the image,
 5. runs [`run_tests.py`](./run_tests.py), which turns that `result.json` into
@@ -66,7 +66,7 @@ allowed commands. It only needs to reach the cluster's Slurm client tools and
    `result_writer.py`, and, if you profile, `profile_kernel.py`).
 4. TA **assignment dirs under `/shared/assignments/<name>`**, each with a
    `reference.py` (and optional `inputs.py` / `tolerance.json`) following the
-   harness contract in [`../../harness/example-assignment/`](../../harness/example-assignment/).
+   harness contract in [`../harness/example-assignment/`](../harness/example-assignment/).
 5. A low-privilege **`autograder` login-node user** whose public key is
    installed in its `~/.ssh/authorized_keys`, matching the private
    `autograder_key.pem` you bake into the image.
@@ -133,8 +133,8 @@ submission:
   scoped SSH key to a low-privilege login-node user that may `sbatch` — not AWS
   access keys. Smaller, safer blast radius.
 - **Single source of truth.** Grading reuses the kit's
-  [`harness/test_kernel.py`](../../harness/test_kernel.py) and its `result.json`
-  schema ([`harness/result_writer.py`](../../harness/result_writer.py)) rather
+  [`harness/test_kernel.py`](../harness/test_kernel.py) and its `result.json`
+  schema ([`harness/result_writer.py`](../harness/result_writer.py)) rather
   than a forked tester, so autograder scores match what students see when they
   run the harness themselves.
 - **Validated compute environment.** The grading job runs on the same trn2

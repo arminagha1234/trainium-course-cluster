@@ -27,14 +27,12 @@ python -m pytest test_handler.py -v
 
 The moto-based unit tests cover Create / Update no-op / Update replace /
 Delete / validation edge cases. They exercise the full boto3 call graph
-without touching real AWS. These are the offline Tier 1 / Tier 2 tests in the
-tiered strategy documented in [`../../docs/testing.md`](../../docs/testing.md).
+without touching real AWS (the offline test tier).
 
 **Known gap**: moto emulates the AWS API surface but does NOT enforce IAM
 authorization. Missing IAM permissions on the Lambda role are only visible
-when you run against real AWS. The Tier 3 real-AWS IAM validation procedure in
-[`../../docs/testing.md`](../../docs/testing.md) catches these; keep it in the
-test cycle before shipping. The Lambda's current required permissions (as of
+when you run against real AWS. Keep a real-AWS IAM validation run in the test
+cycle before shipping to catch these. The Lambda's current required permissions (as of
 last real-AWS validation on 2026-08-14):
 
 - `ec2:CreateKeyPair`, `ec2:DescribeKeyPairs`, `ec2:DeleteKeyPair`

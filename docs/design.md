@@ -1,10 +1,11 @@
-# PCS variant — design
+# Design
 
-How the Trainium Course Cluster maps from **AWS ParallelCluster** (the parent
-kit, `../../`) onto **AWS Parallel Computing Service (PCS)**, and what is not
-built yet. Read the parent kit's [`../../docs/architecture.md`](../../docs/architecture.md)
-first for the shared concepts (single-AZ VPC, MLCB-backed static compute,
-NeuronCore gres, per-student POSIX users, EFS `/shared`).
+How the Trainium Course Cluster runs on **AWS Parallel Computing Service
+(PCS)**, and what is not built yet. The design is presented as a contrast with
+the AWS ParallelCluster approach (an earlier prototype of this kit, since
+retired), because several PCS choices are driven by what PCS does *differently*
+from a self-managed head node. Shared concepts: single-AZ VPC, MLCB-backed
+static compute, per-student POSIX users, EFS `/shared`.
 
 The headline difference: with ParallelCluster you own the head node and its
 `slurmctld`; with PCS the **Slurm controller runs in a service-owned account**
@@ -15,9 +16,9 @@ sync, `gres.conf`, `sacctmgr`) no longer have an obvious home — hence the phas
 follow-up work below (most now implemented but not yet live-validated, one item
 structurally ruled out on PCS, a few still open).
 
-## PC → PCS architecture mapping
+## ParallelCluster → PCS architecture mapping
 
-| Concern | ParallelCluster kit (`../../`) | AWS PCS variant (this kit) | Status |
+| Concern | ParallelCluster approach (retired) | AWS PCS (this kit) | Status |
 |---|---|---|---|
 | Scheduler control plane | `slurmctld` on a head node you own | Managed Slurm controller in a PCS service account | Done (managed) |
 | Cluster definition | `infra/pcluster-config.yaml` (one file) → `pcluster create-cluster` | `aws pcs create-cluster` + `create-compute-node-group` + `create-queue`; mirrored in `infra/pcs.yaml` | Done |
@@ -34,10 +35,10 @@ structurally ruled out on PCS, a few still open).
 | Per-student limits | Head-node-local MariaDB + `slurmdbd` + `sacctmgr` QoS/associations | PCS **managed accounting** (`Accounting.Mode=STANDARD`) + cluster `AccountingStorageEnforce` + `sacctmgr` on the login node — wall-time + concurrent-jobs only (no per-core / core-hours) | **Done, reduced (Phase 3)** |
 | Shared storage `/shared` | PC `SharedStorage: Efs` mounts EFS on every node | EFS filesystem + mount target on the cluster SG, mounted at first boot via UserData; login node mounts the same EFS | **Done (Phase 4)** — not live-validated |
 | Per-student users on compute | `head-node-setup.sh` writes roster to EFS; `compute-node-setup.sh` syncs | Login node creates users + publishes `/shared/etc/passwd.roster`; compute-side periodic re-sync is an optional follow-up | **Done (Phase 1)** — re-sync optional |
-| Budget / kill-switch / teardown | `infra/budget.yaml`, `infra/auto-teardown.yaml` + Lambdas | **Reuse** parent Lambdas (`../../lambda/kill_switch`, `../../lambda/auto_teardown`); wiring TBD | **Open (reuse)** |
-| Student manifest (users + keys) | Parent-stack custom resource (`../../lambda/student_manifest`) | **Reuse** the same Lambda; drive from the login node / a small stack | **Open (reuse)** |
-| Correctness/profiling harness | `../../harness/` | **Reuse** as-is (sources the shared Neuron venv) | Done (reuse) |
-| Slurm job templates | `../../slurm/job-templates/` | Parent `--gres=neuroncore:N` templates **don't schedule on PCS**; ships its own `slurm/job-templates/run.sh` using `--constraint=neuron` | **Changed (Phase 2)** |
+| Budget / kill-switch / teardown | CFN budget + auto-teardown stacks + Lambdas | **Reuse** the shared Lambdas (`../lambda/kill_switch`, `../lambda/auto_teardown`); wiring TBD | **Open (reuse)** |
+| Student manifest (users + keys) | CFN custom resource (`../lambda/student_manifest`) | **Reuse** the same Lambda; drive from the login node / a small stack | **Open (reuse)** |
+| Correctness/profiling harness | `../harness/` | **Reuse** as-is (sources the shared Neuron venv) | Done (reuse) |
+| Slurm job templates | `--gres=neuroncore:N` templates | `--gres` **doesn't schedule on PCS**; ships its own `slurm/job-templates/run.sh` using `--constraint=neuron` | **Changed (Phase 2)** |
 
 ## PHASE STATUS
 
@@ -170,7 +171,8 @@ allow-lists. Students select whole nodes by feature (`--constraint=neuron`)
 rather than requesting individual cores (`--gres=neuroncore:N`); core-level node
 sharing is not enforced (use `--exclusive` for whole-node isolation). With
 approach #4 now ruled out, node-level selection is the ceiling on PCS: if true
-per-core scheduling is required, stay on the ParallelCluster kit (`../../`). And
+per-core scheduling is required, PCS is not the right control plane (a
+self-managed ParallelCluster/Slurm head node is). And
 because `neuroncore` can't be a gres, it can't be a tracked TRES either, which is
 what caps the Phase 3 budgets (below).
 
@@ -309,7 +311,7 @@ kernel or the scheduler.
 The worked example this run validated lives at
 [`../examples/scale_by_two/`](../examples/scale_by_two/) — a complete,
 runnable "hello, Trainium" kernel to hand students as a "run this first to see
-the flow" before the graded `scale_by_two` stub under `../../harness/`.
+the flow" before the graded `scale_by_two` stub under `../harness/`.
 
 ## Notes carried over from the proven run
 

@@ -10,7 +10,7 @@ directly on a compute node inside the shared Neuron venv:
     python run_example.py
 
 It is intentionally standalone — it does NOT use the grading harness under
-`../../../harness/`. The point is to show the whole flow in one readable file
+`../../harness/`. The point is to show the whole flow in one readable file
 before you meet the graded assignment.
 """
 import numpy as np

@@ -310,9 +310,9 @@ harden_imds || echo "[trn-course-pcs] WARN: IMDS hardening step failed; review b
 # -----------------------------------------------------------------------------
 # 6. Create per-student POSIX users from the roster
 # -----------------------------------------------------------------------------
-# Mirrors ../../bootstrap/head-node-setup.sh sections 1-6: fetch the roster,
-# useradd -M with a fixed UID and home on /shared, install authorized_keys from
-# the roster, publish the canonical /shared/etc/passwd.roster, and harden sshd.
+# Per-student account setup: fetch the roster, useradd -M with a fixed UID and
+# home on /shared, install authorized_keys from the roster, publish the
+# canonical /shared/etc/passwd.roster, and harden sshd.
 # Roster source: s3://${STAGING_BUCKET}/roster/roster.json when a staging bucket
 # was given (read via the instance profile's AmazonS3ReadOnlyAccess, as root, so
 # the section-5 IMDS rule still permits it); otherwise /shared/etc/passwd.roster
